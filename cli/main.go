@@ -145,6 +145,35 @@ func fatal(msg string, args ...interface{}) {
 	os.Exit(1)
 }
 
+// ─── Session State (for listen/watch) ────────────────────────────────────────
+
+func sessionStatePath(sessionID string) string {
+	home, _ := os.UserHomeDir()
+	cfg := loadConfig()
+	agentName := cfg.AgentName
+	if agentName == "" {
+		agentName = "_default"
+	}
+	return filepath.Join(home, ".mesh", "state", agentName, sessionID)
+}
+
+func loadSessionState(sessionID string) int {
+	data, err := os.ReadFile(sessionStatePath(sessionID))
+	if err != nil {
+		return 0
+	}
+	var turn int
+	fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &turn)
+	return turn
+}
+
+func saveSessionState(sessionID string, lastTurn int) {
+	path := sessionStatePath(sessionID)
+	dir := filepath.Dir(path)
+	os.MkdirAll(dir, 0700)
+	os.WriteFile(path, []byte(fmt.Sprintf("%d\n", lastTurn)), 0600)
+}
+
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 func main() {
@@ -182,31 +211,34 @@ HOW IT WORKS
     propose  →  pending  →  accept  →  active  →  complete
                              (or reject)
 
-TYPICAL SESSION FLOW
+TYPICAL SESSION FLOW (human)
 
-  # Teacher proposes a session
   mesh propose student "Build a CLI Todo Manager"
+  mesh pending                    # student checks for proposals
+  mesh accept <session-id>        # student accepts
+  mesh send <session-id> "..."    # exchange messages
+  mesh poll <session-id>          # check for replies
+  mesh complete <session-id>      # close the session
+  mesh transcript <session-id>    # review the conversation
 
-  # Student checks for proposals
-  mesh pending
+AGENT-NATIVE FLOW (for AI agents using mesh as a tool)
 
-  # Student accepts
-  mesh accept <session-id>
+  # Agent proposes and captures the session ID
+  SESSION=$(mesh propose student "Todo Manager" --json | jq -r .session_id)
 
-  # Teacher sends instructions
-  mesh send <session-id> "Here's what to build..."
+  # Agent sends a teaching message, then blocks for a reply
+  mesh send $SESSION "Here's what to build..."
+  REPLY=$(mesh listen $SESSION)
 
-  # Student polls for the message
-  mesh poll <session-id>
+  # Agent reads the reply, thinks, responds, blocks again
+  mesh send $SESSION "Good, now try adding search..."
+  REPLY=$(mesh listen $SESSION)
 
-  # Student works on it, sends back results
-  mesh send <session-id> "Done! Here are my test results..."
+  # When done
+  mesh complete $SESSION
 
-  # Teacher verifies and closes the session
-  mesh complete <session-id>
-
-  # Either side can review the full conversation
-  mesh transcript <session-id>
+  The 'listen' command blocks until the other agent responds, so your
+  agent doesn't need to manage polling — just read and write.
 
 CONFIGURATION
 
@@ -489,6 +521,7 @@ receive messages when they come back.`,
 	// ─── propose ──────────────────────────────────────────────────────
 
 	var proposeDesc string
+	var proposeJSON bool
 	proposeCmd := &cobra.Command{
 		Use:   "propose <agent-name> <topic>",
 		Short: "Propose a skill-sharing session to another agent",
@@ -548,6 +581,22 @@ WHAT HAPPENS
 			}
 
 			sid := result["session_id"].(string)
+
+			if proposeJSON {
+				out := map[string]interface{}{
+					"session_id": sid,
+					"to":         target,
+					"topic":      topic,
+					"status":     "pending",
+				}
+				if token, ok := result["token"].(string); ok {
+					out["token"] = token
+				}
+				data, _ := json.Marshal(out)
+				fmt.Println(string(data))
+				return
+			}
+
 			fmt.Printf("✓ Session proposed to '%s'\n", target)
 			fmt.Printf("  Session ID:  %s\n", sid)
 			fmt.Printf("  Topic:       %s\n", topic)
@@ -559,9 +608,11 @@ WHAT HAPPENS
 		},
 	}
 	proposeCmd.Flags().StringVarP(&proposeDesc, "description", "d", "", "Longer description of the session scope")
+	proposeCmd.Flags().BoolVar(&proposeJSON, "json", false, "Output as JSON (for programmatic use)")
 
 	// ─── pending ──────────────────────────────────────────────────────
 
+	var pendingJSON bool
 	pendingCmd := &cobra.Command{
 		Use:   "pending",
 		Short: "Check for incoming session proposals",
@@ -598,7 +649,17 @@ Use 'mesh accept <session-id>' to accept a proposal, or
 
 			proposals, ok := result["proposals"].([]interface{})
 			if !ok || len(proposals) == 0 {
-				fmt.Println("No pending proposals.")
+				if pendingJSON {
+					fmt.Println("[]")
+				} else {
+					fmt.Println("No pending proposals.")
+				}
+				return
+			}
+
+			if pendingJSON {
+				data, _ := json.Marshal(proposals)
+				fmt.Println(string(data))
 				return
 			}
 
@@ -615,6 +676,7 @@ Use 'mesh accept <session-id>' to accept a proposal, or
 			fmt.Println("  Reject with:  mesh reject <session-id>")
 		},
 	}
+	pendingCmd.Flags().BoolVar(&pendingJSON, "json", false, "Output as JSON (for programmatic use)")
 
 	// ─── accept ───────────────────────────────────────────────────────
 
@@ -764,6 +826,9 @@ TIPS FOR TEACHING SESSIONS
 			if t, ok := result["turn"].(float64); ok {
 				turn = int(t)
 			}
+
+			// Update session state so listen/watch know where we are
+			saveSessionState(sid, turn)
 
 			fmt.Printf("✓ Message sent (turn %d)\n", turn)
 			fmt.Printf("  Poll for reply:  mesh poll %s --since %d\n", sid, turn)
@@ -1124,6 +1189,288 @@ OUTPUT
 	}
 	sessionsCmd.Flags().BoolVarP(&sessionsAll, "all", "a", false, "Show all sessions, including completed and rejected")
 
+	// ─── listen ───────────────────────────────────────────────────────
+
+	var listenJSON bool
+	var listenTimeout int
+	var listenInterval int
+
+	listenCmd := &cobra.Command{
+		Use:   "listen <session-id>",
+		Short: "Block until the next message arrives, then print it",
+		Long: `Block until a new message arrives from the other agent, print it
+to stdout, and exit. Designed to be called by an agent in a loop.
+
+This is the READ side of the agent conversation pipe. The agent calls
+'mesh listen', reads the output, thinks about it, then calls 'mesh send'
+to respond. Repeat until the session is complete.
+
+HOW IT WORKS
+
+  listen tracks the last turn you've seen (stored in ~/.mesh/state/).
+  It polls the relay for messages after that turn, filtering to only
+  messages from the OTHER agent (not your own). When one arrives:
+
+    - Default: prints just the message content to stdout
+    - With --json: prints full metadata as JSON to stdout
+
+  The state file is updated automatically, so the next 'mesh listen'
+  call picks up where you left off.
+
+FLAGS
+
+  --json          Print full message metadata as JSON instead of just content.
+                  Fields: turn, from, content, timestamp, session_status
+
+  --timeout, -t   Maximum seconds to wait before giving up. Default: 300 (5 min).
+                  Exit code 1 on timeout.
+
+  --interval      Seconds between polls. Default: 3.
+
+EXIT CODES
+
+  0   Message received and printed
+  1   Timeout — no message arrived within the timeout window
+  2   Session is completed or no longer active
+
+TYPICAL AGENT USAGE
+
+  An agent's conversation loop looks like this:
+
+    # Propose a session, capture the session ID
+    SESSION_ID=$(mesh propose student "Todo Manager" --json | jq -r .session_id)
+
+    # Wait for acceptance + first message
+    MESSAGE=$(mesh listen $SESSION_ID)
+
+    # Think about it... then respond
+    mesh send $SESSION_ID "I've built the thing, here's what I did..."
+
+    # Wait for the next message
+    MESSAGE=$(mesh listen $SESSION_ID)
+
+    # ...and so on until done
+    mesh complete $SESSION_ID
+
+  The agent never sees HTTP, never manages polling, never tracks turn
+  numbers. It just reads and writes.`,
+		Example: `  # Block until a message arrives (prints content to stdout)
+  mesh listen a3f8c2d1
+
+  # Get full metadata as JSON
+  mesh listen a3f8c2d1 --json
+
+  # Custom timeout (60 seconds)
+  mesh listen a3f8c2d1 --timeout 60
+
+  # In a script:
+  MSG=$(mesh listen $SID)
+  if [ $? -eq 0 ]; then
+    echo "Got message: $MSG"
+  elif [ $? -eq 2 ]; then
+    echo "Session ended"
+  else
+    echo "Timed out"
+  fi`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			sid := args[0]
+			cfg := loadConfig()
+
+			if cfg.AgentName == "" {
+				fatal("agent-name not configured. Run: mesh config set agent-name <name>")
+			}
+
+			// Load last seen turn from state file
+			lastTurn := loadSessionState(sid)
+			startTime := time.Now()
+			timeout := time.Duration(listenTimeout) * time.Second
+
+			for {
+				// Check timeout
+				if time.Since(startTime) > timeout {
+					fmt.Fprintf(os.Stderr, "Timed out waiting for message (%ds)\n", listenTimeout)
+					os.Exit(1)
+				}
+
+				path := fmt.Sprintf("/sessions/%s/poll?since=%d", sid, lastTurn)
+				result, err := doRequest("GET", path, nil, false)
+				if err != nil {
+					fatal("%v", err)
+				}
+
+				status, _ := result["status"].(string)
+
+				// If session is no longer active, exit with code 2
+				if status == "completed" || status == "rejected" {
+					fmt.Fprintf(os.Stderr, "Session %s (%s)\n", status, sid)
+					os.Exit(2)
+				}
+
+				messages, _ := result["messages"].([]interface{})
+				for _, m := range messages {
+					msg := m.(map[string]interface{})
+					from := msg["from"].(string)
+					turn := int(msg["turn"].(float64))
+
+					// Skip our own messages
+					if from == cfg.AgentName {
+						// But still update state so we don't re-process them
+						if turn > lastTurn {
+							lastTurn = turn
+							saveSessionState(sid, lastTurn)
+						}
+						continue
+					}
+
+					// Found a message from the other agent
+					content := msg["content"].(string)
+					if turn > lastTurn {
+						lastTurn = turn
+						saveSessionState(sid, lastTurn)
+					}
+
+					if listenJSON {
+						out := map[string]interface{}{
+							"turn":           turn,
+							"from":           from,
+							"content":        content,
+							"session_status": status,
+						}
+						if ts, ok := msg["timestamp"].(string); ok {
+							out["timestamp"] = ts
+						}
+						data, _ := json.Marshal(out)
+						fmt.Println(string(data))
+					} else {
+						fmt.Print(content)
+					}
+					return
+				}
+
+				// No new messages from the other agent — sleep and retry
+				time.Sleep(time.Duration(listenInterval) * time.Second)
+			}
+		},
+	}
+	listenCmd.Flags().BoolVar(&listenJSON, "json", false, "Output full message metadata as JSON")
+	listenCmd.Flags().IntVarP(&listenTimeout, "timeout", "t", 300, "Maximum seconds to wait for a message")
+	listenCmd.Flags().IntVar(&listenInterval, "interval", 3, "Seconds between polls")
+
+	// ─── watch ────────────────────────────────────────────────────────
+
+	var watchJSON bool
+	var watchInterval int
+
+	watchCmd := &cobra.Command{
+		Use:   "watch <session-id>",
+		Short: "Continuously stream messages as they arrive",
+		Long: `Continuously watch a session and print each new message as it arrives.
+Stays open until the session completes or you kill the process.
+
+This is the STREAMING alternative to 'listen'. While 'listen' blocks for
+ONE message then exits (for use in a request/response loop), 'watch' stays
+open and prints ALL messages as newline-delimited JSON (NDJSON).
+
+This is useful for agents that want to read from a pipe and react to each
+message as it arrives, or for humans monitoring a session in real time.
+
+OUTPUT FORMAT
+
+  Each message is a single line of JSON:
+
+    {"turn":1,"from":"stevens","content":"Here's how to build...","timestamp":"...","session_status":"active"}
+    {"turn":2,"from":"student","content":"Done! Tests pass...","timestamp":"...","session_status":"active"}
+
+  When the session completes, a final line is emitted:
+
+    {"event":"session_complete","session_id":"a3f8c2d1","total_turns":4}
+
+FLAGS
+
+  --json       Always on for watch (this flag exists for symmetry but is default)
+  --interval   Seconds between polls. Default: 3.
+
+EXIT CODES
+
+  0   Session completed normally
+  1   Error communicating with relay`,
+		Example: `  # Watch a session in real time
+  mesh watch a3f8c2d1
+
+  # Pipe to jq for pretty-printing
+  mesh watch a3f8c2d1 | jq .
+
+  # In a script, process each message as it arrives:
+  mesh watch $SID | while IFS= read -r line; do
+    FROM=$(echo "$line" | jq -r .from)
+    CONTENT=$(echo "$line" | jq -r .content)
+    echo "Message from $FROM: $CONTENT"
+  done`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			sid := args[0]
+
+			// Load last seen turn from state file
+			lastTurn := loadSessionState(sid)
+
+			for {
+				path := fmt.Sprintf("/sessions/%s/poll?since=%d", sid, lastTurn)
+				result, err := doRequest("GET", path, nil, false)
+				if err != nil {
+					fatal("%v", err)
+				}
+
+				status, _ := result["status"].(string)
+				messages, _ := result["messages"].([]interface{})
+
+				for _, m := range messages {
+					msg := m.(map[string]interface{})
+					turn := int(msg["turn"].(float64))
+					from := msg["from"].(string)
+					content := msg["content"].(string)
+
+					out := map[string]interface{}{
+						"turn":           turn,
+						"from":           from,
+						"content":        content,
+						"session_status": status,
+					}
+					if ts, ok := msg["timestamp"].(string); ok {
+						out["timestamp"] = ts
+					}
+					data, _ := json.Marshal(out)
+					fmt.Println(string(data))
+
+					if turn > lastTurn {
+						lastTurn = turn
+						saveSessionState(sid, lastTurn)
+					}
+				}
+
+				// If session is completed, emit final event and exit
+				if status == "completed" || status == "rejected" {
+					turnCount := 0
+					if tc, ok := result["turn_count"].(float64); ok {
+						turnCount = int(tc)
+					}
+					final := map[string]interface{}{
+						"event":       "session_" + status,
+						"session_id":  sid,
+						"total_turns": turnCount,
+					}
+					data, _ := json.Marshal(final)
+					fmt.Println(string(data))
+					return
+				}
+
+				time.Sleep(time.Duration(watchInterval) * time.Second)
+			}
+		},
+	}
+	watchCmd.Flags().BoolVar(&watchJSON, "json", false, "Output as JSON (default, exists for symmetry)")
+	watchCmd.Flags().IntVar(&watchInterval, "interval", 3, "Seconds between polls")
+
 	// ─── Assemble command tree ────────────────────────────────────────
 
 	root.AddCommand(
@@ -1137,6 +1484,8 @@ OUTPUT
 		rejectCmd,
 		sendCmd,
 		pollCmd,
+		listenCmd,
+		watchCmd,
 		completeCmd,
 		transcriptCmd,
 		sessionsCmd,
