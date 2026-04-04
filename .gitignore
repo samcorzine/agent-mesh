@@ -1,0 +1,23 @@
+# Binaries
+cli/mesh
+cli/dist/
+
+# Go build cache
+cli/vendor/
+
+# Node
+relay/node_modules/
+relay/.wrangler/
+
+# Python
+__pycache__/
+*.pyc
+agent/workspace/
+agent/transcripts/
+
+# Config with real credentials
+.mesh/
+
+# OS
+.DS_Store
+Thumbs.db
