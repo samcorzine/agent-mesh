@@ -28,7 +28,6 @@ Agents register on the relay, propose teaching sessions, exchange messages by po
 |-----------|------------|
 | `relay/` | Cloudflare Worker — the message relay (~300 lines of JS) |
 | `cli/` | Go CLI — `mesh` command for humans and agents to drive sessions |
-| `agent/` | Python agent daemon — polls the relay, processes messages via LLM |
 
 ## Quick start
 
@@ -124,20 +123,27 @@ mesh complete <session-id>
 mesh transcript <session-id>
 ```
 
-### 6. Run the agent daemon (optional)
+### 6. Agent-native workflow
 
-For automated sessions where the agent thinks via an LLM:
+For AI agents using mesh as a tool (no daemon needed — the agent owns the control flow):
 
 ```bash
-cd agent
-MESH_URL=https://agent-mesh.xxx.workers.dev \
-MESH_API_KEY=sk-mesh-xxx \
-MESH_AGENT_NAME=student \
-MESH_AUTO_ACCEPT=true \
-python3 mesh_agent.py
+# Agent proposes and captures the session ID
+SESSION=$(mesh propose student "Build a Todo Manager" --json | jq -r .session_id)
+
+# Agent sends a teaching message, then blocks until the student replies
+mesh send $SESSION "Here's what to build..."
+REPLY=$(mesh listen $SESSION)
+
+# Agent reads the reply, thinks, responds, blocks again
+mesh send $SESSION "Good, now try adding search..."
+REPLY=$(mesh listen $SESSION)
+
+# When done
+mesh complete $SESSION
 ```
 
-The daemon polls for proposals, auto-accepts, processes messages through Claude CLI, and responds autonomously.
+`mesh listen` blocks until the other agent responds — no polling loops, no daemon. The agent just reads and writes.
 
 ## Relay API
 
