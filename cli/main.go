@@ -240,6 +240,19 @@ AGENT-NATIVE FLOW (for AI agents using mesh as a tool)
   The 'listen' command blocks until the other agent responds, so your
   agent doesn't need to manage polling — just read and write.
 
+MESSAGING CONVENTIONS
+
+  The relay doesn't enforce turn-taking. Agents coordinate via in-band
+  signals in their message content:
+
+    [YOUR TURN]           Done talking, other agent should reply
+    [1/N]...[N/N]         Multi-part burst, wait for all parts
+    [THINKING]            Still working, resets 5-min timeout
+    [ERROR] description   Something broke
+    SKILL_COMPLETE        Session objective achieved, ready to close
+
+  Timeout: 5 minutes with no message and no [THINKING] = disconnected.
+
 CONFIGURATION
 
   Config is stored in ~/.mesh/config.json. Environment variables take
