@@ -72,7 +72,8 @@ type APIError struct {
 	Error string `json:"error"`
 }
 
-func doRequest(method, path string, body interface{}, useAdmin bool) (map[string]interface{}, error) {
+// authMode: "admin" uses X-Admin-Key, "agent" uses X-API-Key, "none" sends no auth
+func doRequestWithAuth(method, path string, body interface{}, authMode string) (map[string]interface{}, error) {
 	cfg := loadConfig()
 
 	if cfg.URL == "" {
@@ -97,16 +98,19 @@ func doRequest(method, path string, body interface{}, useAdmin bool) (map[string
 
 	req.Header.Set("Content-Type", "application/json")
 
-	if useAdmin {
+	switch authMode {
+	case "admin":
 		if cfg.AdminKey == "" {
 			return nil, fmt.Errorf("admin key not configured. Run: mesh config set admin-key <key>")
 		}
 		req.Header.Set("X-Admin-Key", cfg.AdminKey)
-	} else {
+	case "agent":
 		if cfg.APIKey == "" {
 			return nil, fmt.Errorf("API key not configured. Run: mesh config set api-key <key>")
 		}
 		req.Header.Set("X-API-Key", cfg.APIKey)
+	case "none":
+		// No auth header — invite code is in the request body
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -131,6 +135,13 @@ func doRequest(method, path string, body interface{}, useAdmin bool) (map[string
 	}
 
 	return result, nil
+}
+
+func doRequest(method, path string, body interface{}, useAdmin bool) (map[string]interface{}, error) {
+	if useAdmin {
+		return doRequestWithAuth(method, path, body, "admin")
+	}
+	return doRequestWithAuth(method, path, body, "agent")
 }
 
 // ─── Output Helpers ─────────────────────────────────────────────────────────
@@ -239,19 +250,6 @@ AGENT-NATIVE FLOW (for AI agents using mesh as a tool)
 
   The 'listen' command blocks until the other agent responds, so your
   agent doesn't need to manage polling — just read and write.
-
-MESSAGING CONVENTIONS
-
-  The relay doesn't enforce turn-taking. Agents coordinate via in-band
-  signals in their message content:
-
-    [YOUR TURN]           Done talking, other agent should reply
-    [1/N]...[N/N]         Multi-part burst, wait for all parts
-    [THINKING]            Still working, resets 5-min timeout
-    [ERROR] description   Something broke
-    SKILL_COMPLETE        Session objective achieved, ready to close
-
-  Timeout: 5 minutes with no message and no [THINKING] = disconnected.
 
 CONFIGURATION
 
@@ -416,14 +414,13 @@ required for the health check.`,
 
 	// ─── register ─────────────────────────────────────────────────────
 
+	var registerInvite string
 	registerCmd := &cobra.Command{
-		Use:   "register <name> <owner>",
-		Short: "Register a new agent on the relay (admin only)",
-		Long: `Register a new agent on the relay server. Requires the admin key.
+		Use:   "register <name> [owner]",
+		Short: "Register a new agent on the relay",
+		Long: `Register a new agent on the relay server.
 
-This creates a new agent identity and returns an API key. Give the API
-key to the agent's owner — they'll use it to authenticate all future
-requests.
+Requires either the admin key or a single-use invite code.
 
 ARGUMENTS
 
@@ -432,7 +429,12 @@ ARGUMENTS
           Examples: stevens, jarvis, home-bot, alaina-agent
 
   owner   The human owner's name. For reference only — not used for auth.
-          Examples: "Sam", "Bob", "Alaina"
+          Optional when using an invite code.
+
+FLAGS
+
+  --invite, -i   A single-use invite code for self-registration.
+                 Get one from a relay admin. No admin key needed.
 
 WHAT HAPPENS
 
@@ -440,30 +442,42 @@ WHAT HAPPENS
   2. A unique API key (sk-mesh-...) is generated and returned
   3. The agent's owner configures their agent with this key
   4. The agent can now propose sessions, send messages, etc.
-
-SECURITY
-
-  Only someone with the admin key can register agents. There is no
-  self-registration. This means you control exactly who has access
-  to the relay.`,
-		Example: `  # Register a new agent
+  5. If an invite code was used, it's consumed (one-time use)`,
+		Example: `  # Register with admin key
   mesh register jarvis "Bob"
 
-  # The command returns an API key — give it to Bob:
-  #   ✓ Agent 'jarvis' registered
+  # Self-register with an invite code (no admin key needed)
+  mesh register myagent --invite inv-abc123def456
+
+  # The command returns an API key:
+  #   ✓ Agent 'myagent' registered
   #   API key: sk-mesh-a1b2c3d4e5f6...
   #
-  # Bob then runs:
+  # Then configure your CLI:
   #   mesh config set api-key sk-mesh-a1b2c3d4e5f6...
-  #   mesh config set agent-name jarvis`,
-		Args: cobra.ExactArgs(2),
+  #   mesh config set agent-name myagent`,
+		Args: cobra.RangeArgs(1, 2),
 		Run: func(cmd *cobra.Command, args []string) {
-			name, owner := args[0], args[1]
+			name := args[0]
+			owner := ""
+			if len(args) > 1 {
+				owner = args[1]
+			}
 
-			result, err := doRequest("POST", "/agents/register", map[string]string{
+			body := map[string]string{
 				"name":  name,
 				"owner": owner,
-			}, true)
+			}
+
+			var result map[string]interface{}
+			var err error
+
+			if registerInvite != "" {
+				body["invite_code"] = registerInvite
+				result, err = doRequestWithAuth("POST", "/agents/register", body, "none")
+			} else {
+				result, err = doRequest("POST", "/agents/register", body, true)
+			}
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -472,9 +486,121 @@ SECURITY
 			if key, ok := result["api_key"].(string); ok {
 				fmt.Printf("  API key: %s\n", key)
 				fmt.Println()
-				fmt.Println("  Give this key to the agent's owner. They should run:")
+				fmt.Println("  Save this — it won't be shown again.")
+				fmt.Println()
+				fmt.Println("  Configure your CLI:")
 				fmt.Printf("    mesh config set api-key %s\n", key)
 				fmt.Printf("    mesh config set agent-name %s\n", name)
+			}
+		},
+	}
+	registerCmd.Flags().StringVarP(&registerInvite, "invite", "i", "", "Single-use invite code for self-registration")
+
+	// ─── invite ───────────────────────────────────────────────────────
+
+	inviteCmd := &cobra.Command{
+		Use:   "invite [count]",
+		Short: "Generate invite codes (admin only)",
+		Long: `Generate single-use invite codes for agent self-registration.
+
+Share these codes with people who want to register their own agents.
+Each code can be used exactly once — after registration, it's consumed.
+
+ARGUMENTS
+
+  count   Number of codes to generate (1-20). Default: 1.
+
+SECURITY
+
+  Only admins can generate invite codes. Each code is single-use.
+  You can audit code usage with 'mesh invites'.`,
+		Example: `  # Generate one invite code
+  mesh invite
+
+  # Generate 5 invite codes
+  mesh invite 5
+
+  # Output:
+  #   Generated 5 invite code(s):
+  #     inv-a1b2c3d4e5f6a1b2c3d4e5f6
+  #     inv-d4e5f6a1b2c3d4e5f6a1b2c3
+  #     ...`,
+		Args: cobra.MaximumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			count := 1
+			if len(args) > 0 {
+				fmt.Sscanf(args[0], "%d", &count)
+				if count < 1 {
+					count = 1
+				}
+				if count > 20 {
+					count = 20
+				}
+			}
+
+			result, err := doRequest("POST", "/invites", map[string]int{"count": count}, true)
+			if err != nil {
+				fatal("%v", err)
+			}
+
+			codes, ok := result["codes"].([]interface{})
+			if !ok {
+				printJSON(result)
+				return
+			}
+
+			fmt.Printf("Generated %d invite code(s):\n", len(codes))
+			for _, c := range codes {
+				fmt.Printf("  %s\n", c.(string))
+			}
+		},
+	}
+
+	// ─── invites ──────────────────────────────────────────────────────
+
+	invitesCmd := &cobra.Command{
+		Use:   "invites",
+		Short: "List all invite codes (admin only)",
+		Long: `List all invite codes and their status.
+
+Shows which codes are available, which have been used, and by whom.
+Useful for auditing who has been given access to the relay.`,
+		Example: `  mesh invites
+
+  # Output:
+  #   inv-a1b2c3d4e5f6  available      (created 2026-04-08)
+  #   inv-d4e5f6a1b2c3  used by jarvis (created 2026-04-07)`,
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			result, err := doRequest("GET", "/invites", nil, true)
+			if err != nil {
+				fatal("%v", err)
+			}
+
+			invites, ok := result["invites"].([]interface{})
+			if !ok || len(invites) == 0 {
+				fmt.Println("No invite codes.")
+				return
+			}
+
+			fmt.Println("Invite codes:")
+			for _, inv := range invites {
+				i := inv.(map[string]interface{})
+				code := i["code"].(string)
+				created := ""
+				if c, ok := i["created_at"].(string); ok {
+					if t, err := time.Parse(time.RFC3339, c); err == nil {
+						created = t.Format("2006-01-02")
+					} else {
+						created = c
+					}
+				}
+
+				if usedBy, ok := i["used_by"].(string); ok && usedBy != "" {
+					fmt.Printf("  %s  used by %-12s (created %s)\n", code, usedBy, created)
+				} else {
+					fmt.Printf("  %s  available          (created %s)\n", code, created)
+				}
 			}
 		},
 	}
@@ -1490,6 +1616,8 @@ EXIT CODES
 		configCmd,
 		statusCmd,
 		registerCmd,
+		inviteCmd,
+		invitesCmd,
 		agentsCmd,
 		proposeCmd,
 		pendingCmd,
