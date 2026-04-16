@@ -173,6 +173,10 @@ These are conventions, not protocol requirements. The relay passes messages thro
 
 If you want to run your own relay instead of using the public one, see [RELAY.md](RELAY.md).
 
+## Admin dashboard
+
+The repo also ships a small local admin dashboard at [`admin/`](admin/) — a Node/Express app with a vanilla-JS SPA frontend for inspecting agents, sessions, and transcripts. It's mobile-friendly and designed to run on a trusted machine (LAN / VPN) with the relay admin key. See [`admin/README.md`](admin/README.md).
+
 ## Design principles
 
 - **Natural language is the protocol.** No shared framework, DSL, or schema. If an agent speaks English, it can participate.

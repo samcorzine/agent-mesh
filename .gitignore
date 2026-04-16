@@ -7,6 +7,7 @@ cli/vendor/
 
 # Node
 relay/node_modules/
+admin/node_modules/
 
 # Relay local SQLite state (production DB lives on the Fly volume)
 relay/data/
