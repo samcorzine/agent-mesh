@@ -687,6 +687,32 @@ are no longer in use.`,
 		},
 	}
 
+	// ─── delete-session (admin) ──────────────────────────────────────
+
+	deleteSessionCmd := &cobra.Command{
+		Use:   "delete-session <session-id>",
+		Short: "Delete a session and its messages (admin only)",
+		Long: `Delete a session from the relay, removing all of its messages too.
+
+Requires the admin key (set via 'mesh config set admin-key <key>' or
+the MESH_ADMIN_KEY environment variable). This is a destructive
+operation and cannot be undone.
+
+Useful for cleaning up stale or unwanted sessions without touching
+the agents themselves.`,
+		Example: `  mesh delete-session a3f8c2d1b5e9
+  mesh delete-session <session-id>`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			sid := args[0]
+			_, err := doRequestWithAuth("DELETE", "/sessions/"+sid, nil, "admin")
+			if err != nil {
+				fatal("%v", err)
+			}
+			fmt.Printf("Deleted session '%s'\n", sid)
+		},
+	}
+
 	// ─── propose ──────────────────────────────────────────────────────
 
 	var proposeDesc string
@@ -1169,6 +1195,7 @@ WHEN TO COMPLETE
 	// ─── transcript ───────────────────────────────────────────────────
 
 	var transcriptJSON bool
+	var transcriptAdmin bool
 	transcriptCmd := &cobra.Command{
 		Use:   "transcript <session-id>",
 		Short: "View the full conversation log for a session",
@@ -1210,7 +1237,7 @@ AUDITING
 		Run: func(cmd *cobra.Command, args []string) {
 			sid := args[0]
 
-			result, err := doRequest("GET", fmt.Sprintf("/sessions/%s/transcript", sid), nil, false)
+			result, err := doRequest("GET", fmt.Sprintf("/sessions/%s/transcript", sid), nil, transcriptAdmin)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -1274,10 +1301,14 @@ AUDITING
 		},
 	}
 	transcriptCmd.Flags().BoolVar(&transcriptJSON, "json", false, "Output raw JSON")
+	transcriptCmd.Flags().BoolVar(&transcriptAdmin, "admin", false, "Use admin key to view any session (admin only)")
 
 	// ─── sessions ─────────────────────────────────────────────────────
 
 	var sessionsAll bool
+	var sessionsAdmin bool
+	var sessionsStatus string
+	var sessionsAgent string
 	sessionsCmd := &cobra.Command{
 		Use:   "sessions",
 		Short: "List all your sessions",
@@ -1309,7 +1340,7 @@ OUTPUT
   #   [b7e2f9a4]  rosie → stevens    "Weather alerts setup"        pending`,
 		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			result, err := doRequest("GET", "/sessions", nil, false)
+			result, err := doRequest("GET", "/sessions", nil, sessionsAdmin)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -1320,19 +1351,31 @@ OUTPUT
 				return
 			}
 
+			statusFilter := strings.ToLower(strings.TrimSpace(sessionsStatus))
+			agentFilter := strings.ToLower(strings.TrimSpace(sessionsAgent))
+
 			displayed := 0
 			for _, s := range sessions {
 				sess := s.(map[string]interface{})
 				status := sess["status"].(string)
 
-				if !sessionsAll && (status == "completed" || status == "rejected") {
+				if statusFilter != "" {
+					if strings.ToLower(status) != statusFilter {
+						continue
+					}
+				} else if !sessionsAll && (status == "completed" || status == "rejected") {
+					continue
+				}
+
+				from, _ := sess["from"].(string)
+				to, _ := sess["to"].(string)
+
+				if agentFilter != "" && strings.ToLower(from) != agentFilter && strings.ToLower(to) != agentFilter {
 					continue
 				}
 
 				id := sess["id"].(string)
-				from := sess["from"].(string)
-				to := sess["to"].(string)
-				topic := sess["topic"].(string)
+				topic, _ := sess["topic"].(string)
 				turnCount := 0
 				if tc, ok := sess["turn_count"].(float64); ok {
 					turnCount = int(tc)
@@ -1348,8 +1391,8 @@ OUTPUT
 			}
 
 			if displayed == 0 {
-				if sessionsAll {
-					fmt.Println("No sessions.")
+				if sessionsAll || statusFilter != "" || agentFilter != "" {
+					fmt.Println("No sessions match those filters.")
 				} else {
 					fmt.Println("No active or pending sessions. Use --all to see completed ones.")
 				}
@@ -1357,6 +1400,9 @@ OUTPUT
 		},
 	}
 	sessionsCmd.Flags().BoolVarP(&sessionsAll, "all", "a", false, "Show all sessions, including completed and rejected")
+	sessionsCmd.Flags().BoolVar(&sessionsAdmin, "admin", false, "List every session on the relay (admin only)")
+	sessionsCmd.Flags().StringVar(&sessionsStatus, "status", "", "Filter by status (pending, active, completed, rejected)")
+	sessionsCmd.Flags().StringVar(&sessionsAgent, "agent", "", "Filter by participant agent name")
 
 	// ─── listen ───────────────────────────────────────────────────────
 
@@ -1650,6 +1696,7 @@ EXIT CODES
 		invitesCmd,
 		agentsCmd,
 		deleteAgentCmd,
+		deleteSessionCmd,
 		proposeCmd,
 		pendingCmd,
 		acceptCmd,
