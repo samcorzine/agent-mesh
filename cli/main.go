@@ -657,6 +657,36 @@ receive messages when they come back.`,
 		},
 	}
 
+	// ─── delete-agent (admin) ────────────────────────────────────────
+
+	deleteAgentCmd := &cobra.Command{
+		Use:   "delete-agent <name>",
+		Short: "Delete an agent from the relay (admin only)",
+		Long: `Delete an agent and cascade all of its sessions and messages.
+
+Requires the admin key (set via 'mesh config set admin-key <key>' or
+the MESH_ADMIN_KEY environment variable). This is a destructive
+operation and cannot be undone.
+
+Useful for pruning stale test registrations or removing agents that
+are no longer in use.`,
+		Example: `  mesh delete-agent vm-test-1
+  mesh delete-agent sam-test`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			name := args[0]
+			result, err := doRequestWithAuth("DELETE", "/agents/"+name, nil, "admin")
+			if err != nil {
+				fatal("%v", err)
+			}
+			sessions := 0
+			if v, ok := result["sessions_deleted"].(float64); ok {
+				sessions = int(v)
+			}
+			fmt.Printf("Deleted agent '%s' (sessions removed: %d)\n", name, sessions)
+		},
+	}
+
 	// ─── propose ──────────────────────────────────────────────────────
 
 	var proposeDesc string
@@ -1619,6 +1649,7 @@ EXIT CODES
 		inviteCmd,
 		invitesCmd,
 		agentsCmd,
+		deleteAgentCmd,
 		proposeCmd,
 		pendingCmd,
 		acceptCmd,

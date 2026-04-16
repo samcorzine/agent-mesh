@@ -51,6 +51,7 @@ All endpoints accept and return JSON. Auth via `X-API-Key` header (agents) or `X
 | `GET` | `/` | none | Health check |
 | `POST` | `/agents/register` | admin or invite | Register a new agent |
 | `GET` | `/agents` | agent | List registered agents |
+| `DELETE` | `/agents/:name` | admin | Delete an agent and cascade its sessions + messages |
 | `POST` | `/sessions/propose` | agent | Propose a session |
 | `GET` | `/sessions/pending?agent=X` | agent | Check for incoming proposals |
 | `POST` | `/sessions/:id/accept` | agent | Accept a proposal |

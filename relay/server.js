@@ -1,5 +1,5 @@
 /**
- * Agent Mesh — Fly.io relay server (v3.1.0).
+ * Agent Mesh — Fly.io relay server (v3.2.0).
  *
  * A lightweight store-and-forward chat server for peer-to-peer agent
  * skill-sharing sessions. Uses SQLite for persistence and native
@@ -85,6 +85,8 @@ const stmts = {
   getAgentByName: db.prepare("SELECT * FROM agents WHERE name = ?"),
   insertAgent: db.prepare("INSERT INTO agents (name, owner, api_key, registered_at) VALUES (?, ?, ?, ?)"),
   listAgents: db.prepare("SELECT name, owner, registered_at FROM agents"),
+  deleteAgent: db.prepare("DELETE FROM agents WHERE name = ?"),
+  getSessionIdsForAgent: db.prepare("SELECT id FROM sessions WHERE from_agent = ? OR to_agent = ?"),
 
   insertSession: db.prepare(`INSERT INTO sessions (id, token, from_agent, to_agent, topic, description, status, created_at, turn_count, max_turns)
     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, 200)`),
@@ -179,7 +181,7 @@ api.get("/", (req, res) => {
   res.json({
     service: "agent-mesh",
     status: "operational",
-    version: "3.1.0",
+    version: "3.2.0",
     features: ["websocket", "sqlite"],
   });
 });
@@ -228,6 +230,48 @@ api.get("/agents", (req, res) => {
 
   const agents = stmts.listAgents.all();
   res.json({ agents });
+});
+
+api.delete("/agents/:name", (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized — admin only" });
+
+  const name = (req.params.name || "").trim().toLowerCase();
+  const existing = stmts.getAgentByName.get(name);
+  if (!existing) return res.status(404).json({ error: `Agent '${name}' not found` });
+
+  // Gather all sessions the agent participated in, so we can cascade
+  // their messages and any live WebSocket connections along with them.
+  const sessionIds = stmts.getSessionIdsForAgent.all(name, name).map(r => r.id);
+
+  const deleteMessages = db.prepare("DELETE FROM messages WHERE session_id = ?");
+  const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?");
+
+  const txn = db.transaction((agentName, ids) => {
+    for (const id of ids) {
+      deleteMessages.run(id);
+      deleteSession.run(id);
+    }
+    stmts.deleteAgent.run(agentName);
+  });
+
+  txn(name, sessionIds);
+
+  // Close any WS connections attached to the removed sessions
+  for (const id of sessionIds) {
+    const conns = wsConnections.get(id);
+    if (conns) {
+      for (const ws of conns.values()) {
+        try { ws.close(); } catch {}
+      }
+      wsConnections.delete(id);
+    }
+  }
+
+  res.json({
+    name,
+    deleted: true,
+    sessions_deleted: sessionIds.length,
+  });
 });
 
 // ─── routes: invites ─────────────────────────────────────────────────
@@ -629,5 +673,5 @@ app.ws("/api/sessions/:id/ws", handleWs);
 // ─── start ───────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`Agent Mesh relay v3.1.0 listening on port ${PORT}`);
+  console.log(`Agent Mesh relay v3.2.0 listening on port ${PORT}`);
 });
