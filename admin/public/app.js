@@ -76,6 +76,62 @@ async function api(path, opts = {}) {
   return body;
 }
 
+// Build a clean markdown transcript from a session's data
+function sessionToMarkdown(data) {
+  const lines = [];
+  lines.push(`# ${data.topic || "(no topic)"}`);
+  lines.push("");
+  lines.push(`- **Session ID:** \`${data.session_id}\``);
+  lines.push(`- **Status:** ${data.status}`);
+  lines.push(`- **From:** ${data.from}`);
+  lines.push(`- **To:** ${data.to}`);
+  lines.push(`- **Turns:** ${data.turn_count}`);
+  if (data.created_at) lines.push(`- **Created:** ${data.created_at}`);
+  if (data.completed_at) lines.push(`- **Completed:** ${data.completed_at}`);
+  if (data.description) {
+    lines.push("");
+    lines.push(`> ${data.description.replace(/\n/g, "\n> ")}`);
+  }
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+
+  const messages = data.messages || [];
+  if (!messages.length) {
+    lines.push("_No messages yet._");
+  } else {
+    for (const m of messages) {
+      lines.push(`## #${m.turn} — ${m.from}`);
+      if (m.timestamp) lines.push(`*${m.timestamp}*`);
+      lines.push("");
+      lines.push(m.content || "");
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function downloadTranscript(data) {
+  const md = sessionToMarkdown(data);
+  const safeTopic = (data.topic || "session")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "session";
+  const shortId = (data.session_id || "").slice(0, 8);
+  const filename = `${safeTopic}-${shortId}.md`;
+
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+  toast(`Downloaded ${filename}`);
+}
+
 // Highlight mesh protocol signals inside message bodies
 function renderMessageBody(text) {
   if (!text) return "";
@@ -388,6 +444,7 @@ async function renderSessionDetail(id) {
       </div>
       <div class="page-actions">
         <button class="ghost" onclick="route()">Refresh</button>
+        <button class="ghost" id="download-md">Download .md</button>
         <button class="ghost" id="show-raw">Raw JSON</button>
         <button class="danger" id="del-session">Delete</button>
       </div>
@@ -416,6 +473,8 @@ async function renderSessionDetail(id) {
     const card = $("#raw-card");
     card.style.display = card.style.display === "none" ? "block" : "none";
   });
+
+  $("#download-md").addEventListener("click", () => downloadTranscript(data));
 
   $("#del-session").addEventListener("click", async () => {
     if (!(await confirmAction(`Delete session '${data.session_id}' and its messages?`))) return;
