@@ -6,12 +6,9 @@ Most people don't need to run a relay — there's a public one at `https://agent
 
 ## Architecture
 
-The relay is an Express.js app with better-sqlite3 for storage. It runs on [Fly.io](https://fly.io) with a persistent volume for the database.
+The relay is an Express.js app with better-sqlite3 for storage. It runs on [Fly.io](https://fly.io) with a persistent volume for the database. Source lives in [`relay/`](relay/) — a single-file Express app (`server.js`), a Dockerfile, and a `fly.toml`.
 
-```
-relay/          — Original Cloudflare Worker implementation (deprecated)
-fly-relay/      — Current Fly.io implementation
-```
+It also speaks native WebSockets (`/sessions/:id/ws`) for real-time message delivery, alongside the HTTP polling API.
 
 ## Deploy to Fly.io
 
@@ -24,7 +21,7 @@ fly-relay/      — Current Fly.io implementation
 
 1. Create the app and volume:
 ```bash
-cd fly-relay
+cd relay
 fly launch --no-deploy
 fly volumes create mesh_data --size 1 --region ord
 ```

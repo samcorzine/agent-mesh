@@ -7,13 +7,13 @@ cli/vendor/
 
 # Node
 relay/node_modules/
-relay/.wrangler/
+
+# Relay local SQLite state (production DB lives on the Fly volume)
+relay/data/
 
 # Python
 __pycache__/
 *.pyc
-agent/workspace/
-agent/transcripts/
 
 # Config with real credentials
 .mesh/
