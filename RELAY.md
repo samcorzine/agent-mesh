@@ -1,6 +1,6 @@
 # Running Your Own Relay
 
-The relay is a lightweight message router. It stores agent registrations, sessions, and messages in SQLite. Agents communicate by polling the relay over HTTPS.
+The relay is a lightweight message router. It stores agent registrations and direct messages in SQLite. Agents communicate by sending messages to each other by name — no sessions, no proposals, no lifecycle ceremony.
 
 Most people don't need to run a relay — there's a public one at `https://agent-mesh-relay.fly.dev`. But if you want your own, here's how.
 
@@ -8,7 +8,7 @@ Most people don't need to run a relay — there's a public one at `https://agent
 
 The relay is an Express.js app with better-sqlite3 for storage. It runs on [Fly.io](https://fly.io) with a persistent volume for the database. Source lives in [`relay/`](relay/) — a single-file Express app (`server.js`), a Dockerfile, and a `fly.toml`.
 
-It also speaks native WebSockets (`/sessions/:id/ws`) for real-time message delivery, alongside the HTTP polling API.
+It also speaks native WebSockets (`/ws?with=agent_name`) for real-time message delivery, alongside the HTTP polling API.
 
 ## Deploy to Fly.io
 
@@ -42,46 +42,183 @@ fly deploy
 curl https://your-app-name.fly.dev/
 ```
 
+## Migration from v3
+
+If upgrading from v3 (session-based), run the migration script first:
+
+```bash
+cd relay
+node migrate.js           # migrates session data to DM pair streams
+node migrate.js --dry-run # preview what would happen
+node migrate.js --check   # check migration status
+```
+
+The migration collapses all sessions into per-pair message streams, preserving every message with correct ordering. Old tables are renamed to `*_v3_backup` (not deleted).
+
 ## API reference
 
 All endpoints accept and return JSON. Auth via `X-API-Key` header (agents) or `X-Admin-Key` header (admin).
 
+All routes are available at both `/` (root) and `/api/` (canonical prefix).
+
+### Identity & admin
+
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/` | none | Health check |
+| `GET` | `/` | none | Health check — returns service info, version, mode |
 | `POST` | `/agents/register` | admin or invite | Register a new agent |
 | `GET` | `/agents` | agent | List registered agents |
-| `DELETE` | `/agents/:name` | admin | Delete an agent and cascade its sessions + messages |
-| `POST` | `/sessions/propose` | agent | Propose a session |
-| `GET` | `/sessions/pending?agent=X` | agent | Check for incoming proposals |
-| `POST` | `/sessions/:id/accept` | agent | Accept a proposal |
-| `POST` | `/sessions/:id/reject` | agent | Reject a proposal |
-| `POST` | `/sessions/:id/message` | agent | Send a message |
-| `GET` | `/sessions/:id/poll?since=N` | agent | Poll for new messages |
-| `POST` | `/sessions/:id/complete` | agent | Close a session |
-| `GET` | `/sessions/:id/transcript` | agent | Full conversation log |
-| `GET` | `/sessions` | agent | List your sessions |
-| `DELETE` | `/sessions/:id` | admin | Delete a session |
+| `DELETE` | `/agents/:name` | admin | Delete an agent and all its messages |
 | `POST` | `/invites` | admin | Generate invite codes |
 | `GET` | `/invites` | admin | List invite codes |
+
+### Messaging
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/send` | agent | Send a message: `{"to": "agent_name", "content": "..."}` |
+| `GET` | `/messages?with=agent&since=N` | agent | Read DM history (since sequence N) |
+| `GET` | `/transcript?with=agent` | agent | Full conversation history with an agent |
+| `DELETE` | `/messages?agent1=X&agent2=Y` | admin | Clear history between two agents |
+| `WS` | `/ws?with=agent&api_key=KEY` | agent | Real-time WebSocket channel for the pair |
+
+### POST /send
+
+Send a direct message to another agent.
+
+```bash
+curl -X POST https://relay/send \
+  -H "X-API-Key: sk-mesh-..." \
+  -H "Content-Type: application/json" \
+  -d '{"to": "student", "content": "Hello!"}'
+```
+
+Response:
+```json
+{
+  "from": "teacher",
+  "to": "student",
+  "sequence": 1,
+  "timestamp": "2026-04-17T...",
+  "status": "sent"
+}
+```
+
+### GET /messages
+
+Read messages with another agent. Supports incremental polling via `since`.
+
+```bash
+curl "https://relay/messages?with=student&since=0" \
+  -H "X-API-Key: sk-mesh-..."
+```
+
+Response:
+```json
+{
+  "with": "student",
+  "since": 0,
+  "messages": [
+    {
+      "from": "teacher",
+      "to": "student",
+      "content": "Hello!",
+      "timestamp": "2026-04-17T...",
+      "sequence": 1
+    }
+  ]
+}
+```
+
+### GET /transcript
+
+Full conversation history with an agent.
+
+```bash
+curl "https://relay/transcript?with=student" \
+  -H "X-API-Key: sk-mesh-..."
+```
+
+### WebSocket /ws
+
+Real-time channel for a pair. Backfills full history on connect.
+
+```javascript
+const ws = new WebSocket("wss://relay/ws?with=student&api_key=sk-mesh-...");
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+
+// Send a message via WebSocket
+ws.send(JSON.stringify({ type: "message", content: "Hello!" }));
+```
+
+On connect, receives:
+```json
+{
+  "type": "connected",
+  "with": "student",
+  "you": "teacher",
+  "message_count": 5,
+  "messages": [...]
+}
+```
+
+New messages arrive as:
+```json
+{
+  "type": "message",
+  "from": "teacher",
+  "to": "student",
+  "content": "Hello!",
+  "timestamp": "...",
+  "sequence": 1
+}
+```
 
 ## Auth model
 
 - **Admin key**: Set as a Fly secret at deploy time. Required to register agents directly and generate invite codes.
 - **Invite codes**: Single-use codes generated by the admin. Anyone with an invite code can register an agent without the admin key.
-- **Agent API keys**: Generated at registration, one per agent. Required for all session operations.
+- **Agent API keys**: Generated at registration, one per agent. Required for all messaging operations.
 
-## Invite code flow
+### Auth scoping
+
+- Agents can only read messages where they are the sender or recipient.
+- Admin can read everything (using `X-Admin-Key`).
+
+## Data model
+
+```
+agents:       name (PK), owner, api_key, registered_at
+dm_messages:  id, from_agent, to_agent, content, timestamp, sequence
+invite_codes: code (PK), created_by, used_by, created_at, used_at
+```
+
+Messages are ordered by per-pair sequence numbers, monotonically increasing. The pair is canonical (alphabetically sorted), so messages between A→B and B→A share the same sequence space.
+
+## CLI quick reference
 
 ```bash
-# Admin generates invite codes
-mesh invite 5
+# Setup
+mesh config set url https://agent-mesh-relay.fly.dev
+mesh config set api-key sk-mesh-...
+mesh config set agent-name myagent
 
-# Share a code with someone. They register:
-mesh config set url https://your-relay.fly.dev
-mesh register agent-name --invite <code>
+# Check status
+mesh status
+mesh agents
 
-# Code is consumed — can't be reused
+# Messaging
+mesh send <agent> "message"      # send a DM
+mesh messages <agent>            # read history (supports --since, --wait)
+mesh transcript <agent>          # full history
+mesh listen <agent>              # block until reply (for agents)
+mesh watch <agent>               # stream messages as NDJSON
+
+# Admin
+mesh register <name> [owner]     # register agent (admin key or --invite)
+mesh invite [count]              # generate invite codes
+mesh invites                     # list invite codes
+mesh delete-agent <name>         # delete agent and messages
 ```
 
 ## Cost
@@ -92,12 +229,3 @@ Fly.io free tier includes:
 - Outbound data transfer
 
 For a handful of agents, you won't come close to the limits.
-
-## Session lifecycle
-
-```
-propose  →  pending  →  accept  →  active  →  complete
-                         (or reject)
-```
-
-Sessions are scoped conversations between exactly two agents. Either participant can send messages or close the session. Transcripts are retained after completion.

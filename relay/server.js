@@ -1,9 +1,8 @@
 /**
- * Agent Mesh — Fly.io relay server (v3.2.0).
+ * Agent Mesh — Fly.io relay server (v4.0.0).
  *
- * A lightweight store-and-forward chat server for peer-to-peer agent
- * skill-sharing sessions. Uses SQLite for persistence and native
- * WebSockets for real-time messaging.
+ * DM-mode, pair-routed API. Agents send messages to each other by name.
+ * No sessions, no proposals, no lifecycle ceremony.
  *
  * Serves:
  *  - Landing page at / (for browsers)
@@ -41,28 +40,13 @@ db.exec(`
     registered_at TEXT NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    token TEXT NOT NULL,
+  CREATE TABLE IF NOT EXISTS dm_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_agent TEXT NOT NULL,
     to_agent TEXT NOT NULL,
-    topic TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    status TEXT DEFAULT 'pending',
-    created_at TEXT NOT NULL,
-    accepted_at TEXT,
-    completed_at TEXT,
-    turn_count INTEGER DEFAULT 0,
-    max_turns INTEGER DEFAULT 200
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
-    turn INTEGER NOT NULL,
-    from_agent TEXT NOT NULL,
     content TEXT NOT NULL,
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    sequence INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS invite_codes (
@@ -73,10 +57,37 @@ db.exec(`
     used_at TEXT
   );
 
-  CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, turn);
-  CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
-  CREATE INDEX IF NOT EXISTS idx_sessions_to ON sessions(to_agent, status);
+  CREATE INDEX IF NOT EXISTS idx_dm_pair ON dm_messages(from_agent, to_agent);
+  CREATE INDEX IF NOT EXISTS idx_dm_pair_seq ON dm_messages(from_agent, to_agent, sequence);
 `);
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+function randomHex(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+/**
+ * Canonical pair key: sorted alphabetically so (a,b) and (b,a) map
+ * to the same conversation stream.
+ */
+function pairKey(a, b) {
+  return [a, b].sort().join(":");
+}
+
+/**
+ * Get the next sequence number for a pair.
+ * Pair is identified by canonical ordering (both directions).
+ */
+function nextSequence(agent1, agent2) {
+  const [a, b] = [agent1, agent2].sort();
+  const row = db.prepare(`
+    SELECT COALESCE(MAX(sequence), 0) as max_seq
+    FROM dm_messages
+    WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)
+  `).get(a, b, b, a);
+  return row.max_seq + 1;
+}
 
 // ─── prepared statements ─────────────────────────────────────────────
 
@@ -86,35 +97,41 @@ const stmts = {
   insertAgent: db.prepare("INSERT INTO agents (name, owner, api_key, registered_at) VALUES (?, ?, ?, ?)"),
   listAgents: db.prepare("SELECT name, owner, registered_at FROM agents"),
   deleteAgent: db.prepare("DELETE FROM agents WHERE name = ?"),
-  getSessionIdsForAgent: db.prepare("SELECT id FROM sessions WHERE from_agent = ? OR to_agent = ?"),
+  deleteAgentMessages: db.prepare("DELETE FROM dm_messages WHERE from_agent = ? OR to_agent = ?"),
 
-  insertSession: db.prepare(`INSERT INTO sessions (id, token, from_agent, to_agent, topic, description, status, created_at, turn_count, max_turns)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, 200)`),
-  getSession: db.prepare("SELECT * FROM sessions WHERE id = ?"),
-  updateSessionStatus: db.prepare("UPDATE sessions SET status = ?, accepted_at = ? WHERE id = ?"),
-  completeSession: db.prepare("UPDATE sessions SET status = 'completed', completed_at = ? WHERE id = ?"),
-  incrementTurnCount: db.prepare("UPDATE sessions SET turn_count = turn_count + 1 WHERE id = ?"),
-  getPending: db.prepare("SELECT id, from_agent, topic, created_at FROM sessions WHERE to_agent = ? AND status = 'pending'"),
-  listSessions: db.prepare("SELECT id, from_agent, to_agent, topic, status, created_at, turn_count FROM sessions"),
-  listSessionsForAgent: db.prepare(`SELECT id, from_agent, to_agent, topic, status, created_at, turn_count
-    FROM sessions WHERE from_agent = ? OR to_agent = ?`),
+  insertMessage: db.prepare(`
+    INSERT INTO dm_messages (from_agent, to_agent, content, timestamp, sequence)
+    VALUES (?, ?, ?, ?, ?)
+  `),
 
-  insertMessage: db.prepare(`INSERT INTO messages (session_id, turn, from_agent, content, timestamp)
-    VALUES (?, ?, ?, ?, ?)`),
-  getMessagesSince: db.prepare("SELECT turn, from_agent, content, timestamp FROM messages WHERE session_id = ? AND turn > ? ORDER BY turn"),
-  getAllMessages: db.prepare("SELECT turn, from_agent, content, timestamp FROM messages WHERE session_id = ? ORDER BY turn"),
+  // Get messages for a pair since a given sequence number
+  getMessagesSince: db.prepare(`
+    SELECT id, from_agent, to_agent, content, timestamp, sequence
+    FROM dm_messages
+    WHERE ((from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?))
+      AND sequence > ?
+    ORDER BY sequence
+  `),
+
+  // Get all messages for a pair
+  getAllMessages: db.prepare(`
+    SELECT id, from_agent, to_agent, content, timestamp, sequence
+    FROM dm_messages
+    WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)
+    ORDER BY sequence
+  `),
+
+  // Delete messages for a specific pair
+  deletePairMessages: db.prepare(`
+    DELETE FROM dm_messages
+    WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)
+  `),
 
   insertInvite: db.prepare("INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)"),
   getInvite: db.prepare("SELECT * FROM invite_codes WHERE code = ?"),
   useInvite: db.prepare("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ?"),
   listInvites: db.prepare("SELECT code, created_by, used_by, created_at, used_at FROM invite_codes ORDER BY created_at DESC"),
 };
-
-// ─── helpers ─────────────────────────────────────────────────────────
-
-function randomHex(bytes = 16) {
-  return crypto.randomBytes(bytes).toString("hex");
-}
 
 // ─── auth ────────────────────────────────────────────────────────────
 
@@ -130,15 +147,16 @@ function authenticateAgent(req) {
 
 // ─── WebSocket tracking ──────────────────────────────────────────────
 
-// sessionId -> Map(agentName -> ws)
+// pairKey -> Map(agentName -> ws)
 const wsConnections = new Map();
 
-function broadcast(sessionId, message, excludeAgent = null) {
-  const conns = wsConnections.get(sessionId);
+function notifyPair(fromAgent, toAgent, message) {
+  const key = pairKey(fromAgent, toAgent);
+  const conns = wsConnections.get(key);
   if (!conns) return;
   const payload = JSON.stringify(message);
   for (const [agent, ws] of conns) {
-    if (agent !== excludeAgent && ws.readyState === 1) {
+    if (ws.readyState === 1) {
       try { ws.send(payload); } catch { conns.delete(agent); }
     }
   }
@@ -154,14 +172,13 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Admin-Key, X-Session-Token");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Admin-Key");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
 // ─── landing page ────────────────────────────────────────────────────
 
-// Read the landing page HTML at startup
 const LANDING_PAGE_PATH = join(__dirname, "public", "index.html");
 let landingPageHtml = "";
 try {
@@ -171,8 +188,6 @@ try {
 }
 
 // ─── API router ──────────────────────────────────────────────────────
-// All API routes are defined on a sub-router so they can be mounted
-// at both "/" (backward compat) and "/api" (new canonical path).
 
 const api = express.Router();
 
@@ -181,8 +196,9 @@ api.get("/", (req, res) => {
   res.json({
     service: "agent-mesh",
     status: "operational",
-    version: "3.2.0",
-    features: ["websocket", "sqlite"],
+    version: "4.0.0",
+    mode: "dm",
+    features: ["websocket", "sqlite", "pair-routing"],
   });
 });
 
@@ -239,39 +255,24 @@ api.delete("/agents/:name", (req, res) => {
   const existing = stmts.getAgentByName.get(name);
   if (!existing) return res.status(404).json({ error: `Agent '${name}' not found` });
 
-  // Gather all sessions the agent participated in, so we can cascade
-  // their messages and any live WebSocket connections along with them.
-  const sessionIds = stmts.getSessionIdsForAgent.all(name, name).map(r => r.id);
-
-  const deleteMessages = db.prepare("DELETE FROM messages WHERE session_id = ?");
-  const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?");
-
-  const txn = db.transaction((agentName, ids) => {
-    for (const id of ids) {
-      deleteMessages.run(id);
-      deleteSession.run(id);
-    }
+  const txn = db.transaction((agentName) => {
+    stmts.deleteAgentMessages.run(agentName, agentName);
     stmts.deleteAgent.run(agentName);
   });
 
-  txn(name, sessionIds);
+  txn(name);
 
-  // Close any WS connections attached to the removed sessions
-  for (const id of sessionIds) {
-    const conns = wsConnections.get(id);
-    if (conns) {
+  // Close any WS connections involving this agent
+  for (const [key, conns] of wsConnections) {
+    if (key.includes(name)) {
       for (const ws of conns.values()) {
         try { ws.close(); } catch {}
       }
-      wsConnections.delete(id);
+      wsConnections.delete(key);
     }
   }
 
-  res.json({
-    name,
-    deleted: true,
-    sessions_deleted: sessionIds.length,
-  });
+  res.json({ name, deleted: true });
 });
 
 // ─── routes: invites ─────────────────────────────────────────────────
@@ -299,250 +300,150 @@ api.get("/invites", (req, res) => {
   res.json({ invites });
 });
 
-// ─── routes: sessions ────────────────────────────────────────────────
+// ─── routes: DM messaging ───────────────────────────────────────────
 
-api.post("/sessions/propose", (req, res) => {
+// POST /send — send a message to another agent
+api.post("/send", (req, res) => {
   const agent = authenticateAgent(req);
   if (!agent) return res.status(401).json({ error: "Unauthorized" });
 
-  const to = (req.body.to || req.body.target || "").trim().toLowerCase();
-  const topic = (req.body.topic || "").trim();
-  const description = req.body.description || "";
+  const to = (req.body.to || "").trim().toLowerCase();
+  const content = (req.body.content || "").trim();
 
   if (!to) return res.status(400).json({ error: "to is required (target agent name)" });
-  if (!topic) return res.status(400).json({ error: "topic is required" });
+  if (!content) return res.status(400).json({ error: "content is required" });
 
   const target = stmts.getAgentByName.get(to);
   if (!target) return res.status(404).json({ error: `Agent '${to}' not found` });
 
-  const sessionId = randomHex(8);
-  const token = randomHex(16);
-  const createdAt = new Date().toISOString();
+  if (to === agent.name) return res.status(400).json({ error: "Cannot send a message to yourself" });
 
-  stmts.insertSession.run(sessionId, token, agent.name, to, topic, description, createdAt);
+  const timestamp = new Date().toISOString();
+  const sequence = nextSequence(agent.name, to);
 
-  res.status(201).json({
-    session_id: sessionId,
-    token,
-    status: "pending",
-    message: `Proposal sent to ${to}`,
+  stmts.insertMessage.run(agent.name, to, content, timestamp, sequence);
+
+  const message = {
+    type: "message",
+    from: agent.name,
+    to,
+    content,
+    timestamp,
+    sequence,
+  };
+
+  // Notify via WebSocket
+  notifyPair(agent.name, to, message);
+
+  res.json({
+    from: agent.name,
+    to,
+    sequence,
+    timestamp,
+    status: "sent",
   });
 });
 
-api.get("/sessions/pending", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const agentName = req.query.agent || agent.name;
-  if (agentName !== agent.name && !isAdmin(req))
-    return res.status(403).json({ error: "Can only check your own pending sessions" });
-
-  const proposals = stmts.getPending.all(agentName).map(p => ({
-    session_id: p.id,
-    from: p.from_agent,
-    topic: p.topic,
-    created_at: p.created_at,
-  }));
-
-  res.json({ proposals });
-});
-
-api.get("/sessions", (req, res) => {
+// GET /messages?with=agent_name&since=N — read DM history
+api.get("/messages", (req, res) => {
   const agent = authenticateAgent(req);
   const admin = isAdmin(req);
   if (!agent && !admin) return res.status(401).json({ error: "Unauthorized" });
 
-  const rows = admin
-    ? stmts.listSessions.all()
-    : stmts.listSessionsForAgent.all(agent.name, agent.name);
-
-  const sessions = rows.map(s => ({
-    id: s.id,
-    from: s.from_agent,
-    to: s.to_agent,
-    topic: s.topic,
-    status: s.status,
-    created_at: s.created_at,
-    turn_count: s.turn_count,
-  }));
-
-  res.json({ sessions });
-});
-
-api.post("/sessions/:id/accept", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (session.to_agent !== agent.name)
-    return res.status(403).json({ error: "This session is not addressed to you" });
-  if (session.status !== "pending")
-    return res.status(400).json({ error: `Session is ${session.status}, not pending` });
-
-  stmts.updateSessionStatus.run("active", new Date().toISOString(), session.id);
-
-  broadcast(session.id, { type: "session_accepted", session_id: session.id });
-
-  res.json({
-    session_id: session.id,
-    token: session.token,
-    status: "active",
-    message: `Session accepted. Topic: ${session.topic}`,
-  });
-});
-
-api.post("/sessions/:id/reject", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (session.to_agent !== agent.name)
-    return res.status(403).json({ error: "This session is not addressed to you" });
-  if (session.status !== "pending")
-    return res.status(400).json({ error: `Session is ${session.status}, not pending` });
-
-  stmts.updateSessionStatus.run("rejected", null, session.id);
-
-  broadcast(session.id, { type: "session_rejected", session_id: session.id });
-
-  res.json({ session_id: session.id, status: "rejected" });
-});
-
-api.post("/sessions/:id/message", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (session.from_agent !== agent.name && session.to_agent !== agent.name)
-    return res.status(403).json({ error: "You are not a participant in this session" });
-  if (session.status !== "active")
-    return res.status(400).json({ error: `Session is ${session.status}, not active` });
-  if (session.turn_count >= session.max_turns)
-    return res.status(400).json({ error: "Max turns reached" });
-
-  const content = (req.body.content || "").trim();
-  if (!content) return res.status(400).json({ error: "content is required" });
-
-  stmts.incrementTurnCount.run(session.id);
-  const turn = session.turn_count + 1;
-  const timestamp = new Date().toISOString();
-
-  stmts.insertMessage.run(session.id, turn, agent.name, content, timestamp);
-
-  const message = { turn, from: agent.name, content, timestamp };
-
-  broadcast(session.id, { type: "message", session_id: session.id, ...message });
-
-  res.json({ session_id: session.id, turn, status: "sent" });
-});
-
-api.get("/sessions/:id/poll", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (session.from_agent !== agent.name && session.to_agent !== agent.name)
-    return res.status(403).json({ error: "You are not a participant in this session" });
+  const withAgent = (req.query.with || "").trim().toLowerCase();
+  if (!withAgent) return res.status(400).json({ error: "with query parameter is required" });
 
   const since = parseInt(req.query.since || "0", 10);
-  const messages = stmts.getMessagesSince.all(session.id, since).map(m => ({
-    turn: m.turn,
+
+  // Auth scoping: agents can only read their own conversations
+  const self = agent ? agent.name : null;
+  if (!admin && self !== null) {
+    // Agent can only read messages where they are sender or recipient
+  } else if (!admin) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const queryAgent = admin && !agent ? withAgent : self;
+  if (!queryAgent && !admin) return res.status(400).json({ error: "Cannot determine agent identity" });
+
+  // For admin without agent auth, we need a "from" perspective
+  // Admin can specify any pair
+  let agent1, agent2;
+  if (admin && !agent) {
+    // Admin needs to specify two agents — use "from" query param or just show the pair
+    const fromAgent = (req.query.from || "").trim().toLowerCase();
+    if (fromAgent) {
+      agent1 = fromAgent;
+      agent2 = withAgent;
+    } else {
+      // Default: just use alphabetical order
+      [agent1, agent2] = [withAgent, withAgent]; // This doesn't make sense for admin
+      return res.status(400).json({ error: "Admin must specify 'from' query param to identify the pair, or use agent auth" });
+    }
+  } else {
+    agent1 = self;
+    agent2 = withAgent;
+  }
+
+  const messages = stmts.getMessagesSince.all(agent1, agent2, agent2, agent1, since).map(m => ({
     from: m.from_agent,
+    to: m.to_agent,
     content: m.content,
     timestamp: m.timestamp,
+    sequence: m.sequence,
   }));
 
-  res.json({
-    session_id: session.id,
-    status: session.status,
-    messages,
-    turn_count: session.turn_count,
-  });
+  res.json({ with: withAgent, messages, since });
 });
 
-api.post("/sessions/:id/complete", (req, res) => {
-  const agent = authenticateAgent(req);
-  if (!agent) return res.status(401).json({ error: "Unauthorized" });
-
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (session.from_agent !== agent.name && session.to_agent !== agent.name)
-    return res.status(403).json({ error: "You are not a participant in this session" });
-
-  if (session.status === "completed")
-    return res.json({ session_id: session.id, status: "completed", message: "Already completed" });
-
-  stmts.completeSession.run(new Date().toISOString(), session.id);
-
-  broadcast(session.id, {
-    type: "session_complete",
-    session_id: session.id,
-    turn_count: session.turn_count,
-    completed_by: agent.name,
-  });
-
-  res.json({
-    session_id: session.id,
-    status: "completed",
-    turn_count: session.turn_count,
-    completed_by: agent.name,
-  });
-});
-
-api.get("/sessions/:id/transcript", (req, res) => {
+// GET /transcript?with=agent_name — full history with an agent
+api.get("/transcript", (req, res) => {
   const agent = authenticateAgent(req);
   const admin = isAdmin(req);
   if (!agent && !admin) return res.status(401).json({ error: "Unauthorized" });
 
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (!admin && session.from_agent !== agent.name && session.to_agent !== agent.name)
-    return res.status(403).json({ error: "You are not a participant in this session" });
+  const withAgent = (req.query.with || "").trim().toLowerCase();
+  if (!withAgent) return res.status(400).json({ error: "with query parameter is required" });
 
-  const messages = stmts.getAllMessages.all(session.id).map(m => ({
-    turn: m.turn,
+  let agent1, agent2;
+  if (admin && !agent) {
+    const fromAgent = (req.query.from || "").trim().toLowerCase();
+    if (!fromAgent) return res.status(400).json({ error: "Admin must specify 'from' query param" });
+    agent1 = fromAgent;
+    agent2 = withAgent;
+  } else {
+    agent1 = agent.name;
+    agent2 = withAgent;
+  }
+
+  const messages = stmts.getAllMessages.all(agent1, agent2, agent2, agent1).map(m => ({
     from: m.from_agent,
+    to: m.to_agent,
     content: m.content,
     timestamp: m.timestamp,
+    sequence: m.sequence,
   }));
 
   res.json({
-    session_id: session.id,
-    topic: session.topic,
-    description: session.description,
-    from: session.from_agent,
-    to: session.to_agent,
-    status: session.status,
-    created_at: session.created_at,
-    completed_at: session.completed_at,
-    turn_count: session.turn_count,
+    between: [agent1, agent2].sort(),
+    message_count: messages.length,
     messages,
   });
 });
 
-api.delete("/sessions/:id", (req, res) => {
+// DELETE /messages?with=agent_name — clear history with an agent (admin only)
+api.delete("/messages", (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized — admin only" });
 
-  const session = stmts.getSession.get(req.params.id);
-  if (!session) return res.status(404).json({ error: "Session not found" });
+  const agent1 = (req.query.agent1 || "").trim().toLowerCase();
+  const agent2 = (req.query.agent2 || req.query.with || "").trim().toLowerCase();
 
-  db.prepare("DELETE FROM messages WHERE session_id = ?").run(req.params.id);
-  db.prepare("DELETE FROM sessions WHERE id = ?").run(req.params.id);
-
-  // Clean up WebSocket connections
-  const conns = wsConnections.get(req.params.id);
-  if (conns) {
-    for (const ws of conns.values()) {
-      try { ws.close(); } catch {}
-    }
-    wsConnections.delete(req.params.id);
+  if (!agent1 || !agent2) {
+    return res.status(400).json({ error: "agent1 and agent2 (or with) query parameters required" });
   }
 
-  res.json({ session_id: req.params.id, deleted: true });
+  const result = stmts.deletePairMessages.run(agent1, agent2, agent2, agent1);
+  res.json({ deleted: result.changes, between: [agent1, agent2].sort() });
 });
 
 // ─── mount API at both / and /api ────────────────────────────────────
@@ -566,67 +467,62 @@ app.get("/", (req, res, next) => {
   }
 });
 
-// Mount API routes at root (backward compatibility with agent-mesh-relay.fly.dev)
+// Mount API routes at root (backward compatibility)
 app.use("/", api);
 
-// Mount API routes at /api prefix (new canonical path for agentmesh.ai)
+// Mount API routes at /api prefix (canonical path)
 app.use("/api", api);
 
 // ─── WebSocket routes ────────────────────────────────────────────────
-// WebSocket routes can't go on a Router easily with express-ws,
-// so we mount them directly at both paths.
 
 function handleWs(ws, req) {
-  const sessionId = req.params.id;
-  const agentName = req.query.agent;
-  const apiKey = req.query.api_key;
+  const withAgent = (req.query.with || "").trim().toLowerCase();
+  const apiKey = req.query.api_key || "";
 
-  if (!agentName || !apiKey) {
-    ws.send(JSON.stringify({ error: "agent and api_key query params required" }));
+  if (!withAgent || !apiKey) {
+    ws.send(JSON.stringify({ error: "with and api_key query params required" }));
     ws.close();
     return;
   }
 
   // Verify agent
   const agent = stmts.getAgentByKey.get(apiKey);
-  if (!agent || agent.name !== agentName) {
+  if (!agent) {
     ws.send(JSON.stringify({ error: "Unauthorized" }));
     ws.close();
     return;
   }
 
-  // Verify session participation
-  const session = stmts.getSession.get(sessionId);
-  if (!session) {
-    ws.send(JSON.stringify({ error: "Session not found" }));
+  // Verify target exists
+  const target = stmts.getAgentByName.get(withAgent);
+  if (!target) {
+    ws.send(JSON.stringify({ error: `Agent '${withAgent}' not found` }));
     ws.close();
     return;
   }
-  if (session.from_agent !== agentName && session.to_agent !== agentName) {
-    ws.send(JSON.stringify({ error: "You are not a participant in this session" }));
-    ws.close();
-    return;
-  }
+
+  const key = pairKey(agent.name, withAgent);
 
   // Track connection
-  if (!wsConnections.has(sessionId)) {
-    wsConnections.set(sessionId, new Map());
+  if (!wsConnections.has(key)) {
+    wsConnections.set(key, new Map());
   }
-  wsConnections.get(sessionId).set(agentName, ws);
+  wsConnections.get(key).set(agent.name, ws);
 
-  // Send current state
-  const messages = stmts.getAllMessages.all(sessionId).map(m => ({
-    turn: m.turn,
+  // Backfill: send full history on connect
+  const messages = stmts.getAllMessages.all(agent.name, withAgent, withAgent, agent.name).map(m => ({
     from: m.from_agent,
+    to: m.to_agent,
     content: m.content,
     timestamp: m.timestamp,
+    sequence: m.sequence,
   }));
 
   ws.send(JSON.stringify({
     type: "connected",
-    session_id: sessionId,
-    status: session.status,
-    turn_count: session.turn_count,
+    with: withAgent,
+    you: agent.name,
+    message_count: messages.length,
     messages,
   }));
 
@@ -635,43 +531,43 @@ function handleWs(ws, req) {
     try {
       const data = JSON.parse(raw);
       if (data.type === "message" && data.content) {
-        const s = stmts.getSession.get(sessionId);
-        if (!s || s.status !== "active") return;
-        if (s.from_agent !== agentName && s.to_agent !== agentName) return;
-
-        stmts.incrementTurnCount.run(sessionId);
-        const turn = s.turn_count + 1;
-        const timestamp = new Date().toISOString();
         const content = data.content.trim();
+        if (!content) return;
 
-        stmts.insertMessage.run(sessionId, turn, agentName, content, timestamp);
+        const timestamp = new Date().toISOString();
+        const sequence = nextSequence(agent.name, withAgent);
 
-        broadcast(sessionId, {
+        stmts.insertMessage.run(agent.name, withAgent, content, timestamp, sequence);
+
+        const message = {
           type: "message",
-          session_id: sessionId,
-          turn,
-          from: agentName,
+          from: agent.name,
+          to: withAgent,
           content,
           timestamp,
-        });
+          sequence,
+        };
+
+        // Notify all connected clients for this pair
+        notifyPair(agent.name, withAgent, message);
       }
     } catch {}
   });
 
   ws.on("close", () => {
-    const conns = wsConnections.get(sessionId);
+    const conns = wsConnections.get(key);
     if (conns) {
-      conns.delete(agentName);
-      if (conns.size === 0) wsConnections.delete(sessionId);
+      conns.delete(agent.name);
+      if (conns.size === 0) wsConnections.delete(key);
     }
   });
 }
 
-app.ws("/sessions/:id/ws", handleWs);
-app.ws("/api/sessions/:id/ws", handleWs);
+app.ws("/ws", handleWs);
+app.ws("/api/ws", handleWs);
 
 // ─── start ───────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`Agent Mesh relay v3.2.0 listening on port ${PORT}`);
+  console.log(`Agent Mesh relay v4.0.0 (DM mode) listening on port ${PORT}`);
 });
