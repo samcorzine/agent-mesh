@@ -256,7 +256,7 @@ main {
   gap: 10px;
   margin-bottom: 16px;
 }
-@media (min-width: 640px) { .stat-grid { grid-template-columns: repeat(4, 1fr); } }
+@media (min-width: 640px) { .stat-grid { grid-template-columns: repeat(3, 1fr); } }
 .stat {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -277,6 +277,8 @@ main {
 .stat .value.active { color: var(--green); }
 .stat .value.pending { color: var(--amber); }
 .stat .value.completed { color: var(--purple); }
+.stat .value.conversations { color: var(--accent); }
+.stat .value.messages { color: var(--green); }
 
 /* ─── list (mobile-friendly tables) ──────────────────────── */
 .list {
@@ -347,10 +349,22 @@ main {
   border: 1px solid var(--border);
   white-space: nowrap;
 }
-.badge.active { color: var(--green); border-color: rgba(74, 222, 128, 0.3); background: rgba(74, 222, 128, 0.08); }
+.badge.active, .badge.unused { color: var(--green); border-color: rgba(74, 222, 128, 0.3); background: rgba(74, 222, 128, 0.08); }
 .badge.pending { color: var(--amber); border-color: rgba(251, 191, 36, 0.3); background: rgba(251, 191, 36, 0.08); }
-.badge.completed { color: var(--purple); border-color: rgba(167, 139, 250, 0.3); background: rgba(167, 139, 250, 0.08); }
+.badge.completed, .badge.used { color: var(--purple); border-color: rgba(167, 139, 250, 0.3); background: rgba(167, 139, 250, 0.08); }
 .badge.rejected { color: var(--red); border-color: rgba(248, 113, 113, 0.3); background: rgba(248, 113, 113, 0.08); }
+.badge.msg-count { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-soft); }
+
+/* ─── message preview in list items ──────────────────────── */
+.list-item .preview {
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
 
 /* ─── filters ─────────────────────────────────────────────── */
 .filters {
@@ -360,7 +374,7 @@ main {
   margin-bottom: 12px;
 }
 @media (min-width: 640px) {
-  .filters { grid-template-columns: 2fr 1fr 1fr auto; }
+  .filters { grid-template-columns: 2fr 1fr auto; }
 }
 
 /* ─── session detail ──────────────────────────────────────── */
@@ -414,12 +428,15 @@ main {
   font-family: var(--mono);
   font-size: 11px;
 }
-.message .turn {
+.message .turn, .message .seq {
   color: var(--text-faint);
   font-family: var(--mono);
   font-size: 11px;
   margin-right: 6px;
 }
+.message.from-a2 { border-left: 3px solid var(--purple); }
+.message.from-a1 { border-left: 3px solid var(--accent); }
+.message.from-a2 .from { color: var(--purple); }
 .message .body {
   white-space: pre-wrap;
   word-wrap: break-word;

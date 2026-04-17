@@ -1,4 +1,4 @@
-/* Agent Mesh Admin — vanilla JS SPA. */
+/* Agent Mesh Admin — vanilla JS SPA (v4 DM mode). */
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -38,10 +38,6 @@ function fmtTime(iso) {
   });
 }
 
-function statusBadge(status) {
-  return `<span class="badge ${esc(status)}">${esc(status)}</span>`;
-}
-
 function toast(msg, kind = "ok") {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
@@ -56,7 +52,6 @@ function toast(msg, kind = "ok") {
 
 async function confirmAction(message) {
   return new Promise(resolve => {
-    // Use native confirm — simple, keyboard-safe, mobile-compatible
     resolve(window.confirm(message));
   });
 }
@@ -76,22 +71,18 @@ async function api(path, opts = {}) {
   return body;
 }
 
-// Build a clean markdown transcript from a session's data
-function sessionToMarkdown(data) {
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+// Build a clean markdown transcript from conversation data
+function conversationToMarkdown(agent1, agent2, data) {
   const lines = [];
-  lines.push(`# ${data.topic || "(no topic)"}`);
+  lines.push(`# Conversation: ${agent1} ↔ ${agent2}`);
   lines.push("");
-  lines.push(`- **Session ID:** \`${data.session_id}\``);
-  lines.push(`- **Status:** ${data.status}`);
-  lines.push(`- **From:** ${data.from}`);
-  lines.push(`- **To:** ${data.to}`);
-  lines.push(`- **Turns:** ${data.turn_count}`);
-  if (data.created_at) lines.push(`- **Created:** ${data.created_at}`);
-  if (data.completed_at) lines.push(`- **Completed:** ${data.completed_at}`);
-  if (data.description) {
-    lines.push("");
-    lines.push(`> ${data.description.replace(/\n/g, "\n> ")}`);
-  }
+  lines.push(`- **Between:** ${agent1} and ${agent2}`);
+  lines.push(`- **Messages:** ${data.message_count}`);
   lines.push("");
   lines.push("---");
   lines.push("");
@@ -101,7 +92,7 @@ function sessionToMarkdown(data) {
     lines.push("_No messages yet._");
   } else {
     for (const m of messages) {
-      lines.push(`## #${m.turn} — ${m.from}`);
+      lines.push(`## #${m.sequence} — ${m.from}`);
       if (m.timestamp) lines.push(`*${m.timestamp}*`);
       lines.push("");
       lines.push(m.content || "");
@@ -111,16 +102,9 @@ function sessionToMarkdown(data) {
   return lines.join("\n");
 }
 
-function downloadTranscript(data) {
-  const md = sessionToMarkdown(data);
-  const safeTopic = (data.topic || "session")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60) || "session";
-  const shortId = (data.session_id || "").slice(0, 8);
-  const filename = `${safeTopic}-${shortId}.md`;
-
+function downloadTranscript(agent1, agent2, data) {
+  const md = conversationToMarkdown(agent1, agent2, data);
+  const filename = `${agent1}-${agent2}-transcript.md`;
   const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -149,14 +133,25 @@ function renderMessageBody(text) {
   );
 }
 
+// Generate conversation pair URL path (alphabetical order for consistency)
+function convPath(a1, a2) {
+  const sorted = [a1, a2].sort();
+  return `#/conversations/${encodeURIComponent(sorted[0])}/${encodeURIComponent(sorted[1])}`;
+}
+
+function convApiPath(a1, a2) {
+  const sorted = [a1, a2].sort();
+  return `/api/conversations/${encodeURIComponent(sorted[0])}/${encodeURIComponent(sorted[1])}`;
+}
+
 // ─── router ───────────────────────────────────────────────
 
 const routes = [
   { pattern: /^#?\/?$/, handler: renderOverview, tab: "overview" },
   { pattern: /^#\/agents$/, handler: renderAgents, tab: "agents" },
-  { pattern: /^#\/agents\/(.+)$/, handler: renderAgentDetail, tab: "agents" },
-  { pattern: /^#\/sessions$/, handler: renderSessions, tab: "sessions" },
-  { pattern: /^#\/sessions\/(.+)$/, handler: renderSessionDetail, tab: "sessions" },
+  { pattern: /^#\/agents\/([^/]+)$/, handler: renderAgentDetail, tab: "agents" },
+  { pattern: /^#\/conversations$/, handler: renderConversations, tab: "conversations" },
+  { pattern: /^#\/conversations\/([^/]+)\/([^/]+)$/, handler: renderConversationDetail, tab: "conversations" },
   { pattern: /^#\/invites$/, handler: renderInvites, tab: "invites" },
 ];
 
@@ -171,7 +166,7 @@ function route() {
     if (m) {
       $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === r.tab));
       $("#main").innerHTML = `<div class="loading"><div class="spinner"></div></div>`;
-      r.handler(...m.slice(1)).catch(err => {
+      r.handler(...m.slice(1).map(decodeURIComponent)).catch(err => {
         $("#main").innerHTML = `<div class="card"><p style="color: var(--red)">Error: ${esc(err.message)}</p></div>`;
       });
       window.scrollTo(0, 0);
@@ -197,35 +192,54 @@ async function updateRelayStatus() {
   }
 }
 
+// ─── shared: conversation list item ──────────────────────
+
+function conversationItem(c) {
+  const [a1, a2] = c.agents;
+  const preview = c.last_message?.content
+    ? (c.last_message.content.length > 100
+      ? c.last_message.content.slice(0, 100) + "…"
+      : c.last_message.content)
+    : "";
+
+  return `
+    <a class="list-item" href="${convPath(a1, a2)}">
+      <div class="row">
+        <div class="title">${esc(a1)} ↔ ${esc(a2)}</div>
+        <span class="badge msg-count">${c.message_count} msg${c.message_count === 1 ? "" : "s"}</span>
+      </div>
+      <div class="meta">
+        ${c.last_message?.from ? `<span>last: <strong>${esc(c.last_message.from)}</strong></span><span>·</span>` : ""}
+        <span>${timeAgo(c.last_message?.timestamp)}</span>
+      </div>
+      ${preview ? `<div class="preview">${esc(preview)}</div>` : ""}
+    </a>`;
+}
+
 // ─── overview ─────────────────────────────────────────────
 
 async function renderOverview() {
   const data = await api("/api/overview");
-  const c = data.session_counts;
 
   const stats = `
     <div class="stat-grid">
       <div class="stat">
         <div class="label">Agents</div>
-        <div class="value">${c.total === undefined ? "—" : data.agent_count}</div>
+        <div class="value">${data.agent_count}</div>
       </div>
       <div class="stat">
-        <div class="label">Active</div>
-        <div class="value active">${c.active}</div>
+        <div class="label">Conversations</div>
+        <div class="value conversations">${data.conversation_count}</div>
       </div>
       <div class="stat">
-        <div class="label">Pending</div>
-        <div class="value pending">${c.pending}</div>
-      </div>
-      <div class="stat">
-        <div class="label">Sessions</div>
-        <div class="value">${c.total}</div>
+        <div class="label">Messages</div>
+        <div class="value messages">${data.total_messages}</div>
       </div>
     </div>`;
 
-  const recent = data.recent_sessions.length
-    ? data.recent_sessions.map(sessionItem).join("")
-    : `<div class="empty-state">No sessions yet.</div>`;
+  const recent = data.recent_conversations.length
+    ? data.recent_conversations.map(conversationItem).join("")
+    : `<div class="empty-state">No conversations yet.</div>`;
 
   $("#main").innerHTML = `
     <div class="page-header">
@@ -239,7 +253,7 @@ async function renderOverview() {
     </div>
     ${stats}
     <div class="card">
-      <h3>Recent sessions</h3>
+      <h3>Recent conversations</h3>
       <div class="list">${recent}</div>
     </div>
   `;
@@ -249,7 +263,6 @@ async function renderOverview() {
       const fresh = await api("/api/overview");
       const main = $("#main");
       if (!main) return;
-      // Only do a cheap re-render if still on this page
       if (!window.location.hash || window.location.hash === "#/") {
         renderOverviewUpdate(fresh);
       }
@@ -259,37 +272,17 @@ async function renderOverview() {
 
 function renderOverviewUpdate(data) {
   const values = $$(".stat .value");
-  if (values.length < 4) return;
-  const c = data.session_counts;
+  if (values.length < 3) return;
   values[0].textContent = data.agent_count;
-  values[1].textContent = c.active;
-  values[2].textContent = c.pending;
-  values[3].textContent = c.total;
+  values[1].textContent = data.conversation_count;
+  values[2].textContent = data.total_messages;
 
   const list = $(".list");
   if (list) {
-    list.innerHTML = data.recent_sessions.length
-      ? data.recent_sessions.map(sessionItem).join("")
-      : `<div class="empty-state">No sessions yet.</div>`;
+    list.innerHTML = data.recent_conversations.length
+      ? data.recent_conversations.map(conversationItem).join("")
+      : `<div class="empty-state">No conversations yet.</div>`;
   }
-}
-
-function sessionItem(s) {
-  return `
-    <a class="list-item" href="#/sessions/${esc(s.id)}">
-      <div class="row">
-        <div class="title">${esc(s.topic || "(no topic)")}</div>
-        ${statusBadge(s.status)}
-      </div>
-      <div class="meta">
-        <span>${esc(s.from)} → ${esc(s.to)}</span>
-        <span>·</span>
-        <span>${s.turn_count} turn${s.turn_count === 1 ? "" : "s"}</span>
-        <span>·</span>
-        <span>${timeAgo(s.last_activity || s.created_at)}</span>
-        <span class="mono-id" style="margin-left:auto">${esc(s.id)}</span>
-      </div>
-    </a>`;
 }
 
 // ─── agents ───────────────────────────────────────────────
@@ -300,13 +293,14 @@ async function renderAgents() {
     <a class="list-item" href="#/agents/${esc(a.name)}">
       <div class="row">
         <div class="title">${esc(a.name)}</div>
-        ${a.active_count ? `<span class="badge active">${a.active_count} active</span>` : ""}
+        ${a.conversation_count ? `<span class="badge msg-count">${a.conversation_count} conv</span>` : ""}
       </div>
       <div class="meta">
         ${a.owner ? `<span>owner: <strong>${esc(a.owner)}</strong></span><span>·</span>` : ""}
-        <span>${a.session_count} session${a.session_count === 1 ? "" : "s"}</span>
+        <span>${a.message_count} message${a.message_count === 1 ? "" : "s"}</span>
         <span>·</span>
         <span>registered ${timeAgo(a.registered_at)}</span>
+        ${a.last_activity ? `<span>·</span><span>active ${timeAgo(a.last_activity)}</span>` : ""}
       </div>
     </a>`).join("");
 
@@ -327,8 +321,31 @@ async function renderAgents() {
 async function renderAgentDetail(name) {
   const data = await api(`/api/agents/${encodeURIComponent(name)}`);
   const a = data.agent;
-  const sessions = data.sessions.map(sessionItem).join("") ||
-    `<div class="empty-state">This agent has no sessions.</div>`;
+
+  const convItems = data.conversations.length
+    ? data.conversations.map(c => {
+        const peer = c.peer;
+        const preview = c.last_message?.content
+          ? (c.last_message.content.length > 80
+            ? c.last_message.content.slice(0, 80) + "…"
+            : c.last_message.content)
+          : "";
+        return `
+          <a class="list-item" href="${convPath(a.name, peer)}">
+            <div class="row">
+              <div class="title">↔ ${esc(peer)}</div>
+              <span class="badge msg-count">${c.message_count} msg${c.message_count === 1 ? "" : "s"}</span>
+            </div>
+            <div class="meta">
+              ${c.last_message?.from ? `<span>last: <strong>${esc(c.last_message.from)}</strong></span><span>·</span>` : ""}
+              <span>${timeAgo(c.last_message?.timestamp)}</span>
+            </div>
+            ${preview ? `<div class="preview">${esc(preview)}</div>` : ""}
+          </a>`;
+      }).join("")
+    : `<div class="empty-state">This agent has no conversations.</div>`;
+
+  const totalMsgs = data.conversations.reduce((sum, c) => sum + c.message_count, 0);
 
   $("#main").innerHTML = `
     <a href="#/agents" class="back-link">← Agents</a>
@@ -342,16 +359,16 @@ async function renderAgentDetail(name) {
       </div>
     </div>
     <div class="card">
-      <h3>Sessions (${data.sessions.length})</h3>
-      <div class="list">${sessions}</div>
+      <h3>Conversations (${data.conversations.length}) · ${totalMsgs} messages</h3>
+      <div class="list">${convItems}</div>
     </div>
   `;
 
   $("#del-agent").addEventListener("click", async () => {
-    if (!(await confirmAction(`Delete agent '${a.name}' and all of its sessions + messages? This cannot be undone.`))) return;
+    if (!(await confirmAction(`Delete agent '${a.name}' and all of its messages? This cannot be undone.`))) return;
     try {
-      const r = await api(`/api/agents/${encodeURIComponent(a.name)}`, { method: "DELETE" });
-      toast(`Deleted ${a.name} (${r.sessions_deleted || 0} sessions removed)`);
+      await api(`/api/agents/${encodeURIComponent(a.name)}`, { method: "DELETE" });
+      toast(`Deleted ${a.name}`);
       window.location.hash = "#/agents";
     } catch (e) {
       toast(`Failed: ${e.message}`, "err");
@@ -359,48 +376,41 @@ async function renderAgentDetail(name) {
   });
 }
 
-// ─── sessions ─────────────────────────────────────────────
+// ─── conversations ───────────────────────────────────────
 
-let sessionsState = { status: "", agent: "", q: "" };
+let conversationsState = { agent: "", q: "" };
 
-async function renderSessions() {
-  // Preserve filter state across renders
+async function renderConversations() {
   const params = new URLSearchParams();
-  if (sessionsState.status) params.set("status", sessionsState.status);
-  if (sessionsState.agent) params.set("agent", sessionsState.agent);
-  if (sessionsState.q) params.set("q", sessionsState.q);
+  if (conversationsState.agent) params.set("agent", conversationsState.agent);
+  if (conversationsState.q) params.set("q", conversationsState.q);
 
   const [data, agentsRes] = await Promise.all([
-    api(`/api/sessions?${params.toString()}`),
+    api(`/api/conversations?${params.toString()}`),
     api("/api/agents"),
   ]);
 
   const agentOptions = agentsRes.agents
-    .map(a => `<option value="${esc(a.name)}" ${sessionsState.agent === a.name ? "selected" : ""}>${esc(a.name)}</option>`)
+    .map(a => `<option value="${esc(a.name)}" ${conversationsState.agent === a.name ? "selected" : ""}>${esc(a.name)}</option>`)
     .join("");
 
-  const items = data.sessions.map(sessionItem).join("") ||
-    `<div class="empty-state">No sessions match these filters.</div>`;
+  const items = data.conversations.map(conversationItem).join("") ||
+    `<div class="empty-state">No conversations match these filters.</div>`;
+
+  const totalMsgs = data.conversations.reduce((sum, c) => sum + c.message_count, 0);
 
   $("#main").innerHTML = `
     <div class="page-header">
       <div>
-        <h2>Sessions</h2>
-        <div class="subtitle">${data.sessions.length} session${data.sessions.length === 1 ? "" : "s"}</div>
+        <h2>Conversations</h2>
+        <div class="subtitle">${data.conversations.length} conversation${data.conversations.length === 1 ? "" : "s"} · ${totalMsgs} messages</div>
       </div>
       <div class="page-actions">
         <button class="ghost" onclick="route()">Refresh</button>
       </div>
     </div>
     <div class="filters">
-      <input type="search" id="f-q" placeholder="Search topic, id, agent…" value="${esc(sessionsState.q)}">
-      <select id="f-status">
-        <option value="">All statuses</option>
-        <option value="pending" ${sessionsState.status === "pending" ? "selected" : ""}>Pending</option>
-        <option value="active" ${sessionsState.status === "active" ? "selected" : ""}>Active</option>
-        <option value="completed" ${sessionsState.status === "completed" ? "selected" : ""}>Completed</option>
-        <option value="rejected" ${sessionsState.status === "rejected" ? "selected" : ""}>Rejected</option>
-      </select>
+      <input type="search" id="f-q" placeholder="Search by agent name…" value="${esc(conversationsState.q)}">
       <select id="f-agent">
         <option value="">All agents</option>
         ${agentOptions}
@@ -410,53 +420,47 @@ async function renderSessions() {
     <div class="list">${items}</div>
   `;
 
-  $("#f-q").addEventListener("input", debounce(e => { sessionsState.q = e.target.value; renderSessions(); }, 300));
-  $("#f-status").addEventListener("change", e => { sessionsState.status = e.target.value; renderSessions(); });
-  $("#f-agent").addEventListener("change", e => { sessionsState.agent = e.target.value; renderSessions(); });
-  $("#f-clear").addEventListener("click", () => { sessionsState = { status: "", agent: "", q: "" }; renderSessions(); });
+  $("#f-q").addEventListener("input", debounce(e => { conversationsState.q = e.target.value; renderConversations(); }, 300));
+  $("#f-agent").addEventListener("change", e => { conversationsState.agent = e.target.value; renderConversations(); });
+  $("#f-clear").addEventListener("click", () => { conversationsState = { agent: "", q: "" }; renderConversations(); });
 }
 
-function debounce(fn, ms) {
-  let t;
-  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-}
-
-async function renderSessionDetail(id) {
-  const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
+async function renderConversationDetail(agent1, agent2) {
+  const data = await api(convApiPath(agent1, agent2));
 
   const messages = (data.messages || []).map(m => `
-    <div class="message">
+    <div class="message ${m.from === agent1 ? 'from-a1' : 'from-a2'}">
       <div class="head">
-        <div><span class="turn">#${m.turn}</span><span class="from">${esc(m.from)}</span></div>
+        <div><span class="seq">#${m.sequence}</span><span class="from">${esc(m.from)}</span></div>
         <div class="ts" title="${esc(m.timestamp)}">${fmtTime(m.timestamp)}</div>
       </div>
       <div class="body">${renderMessageBody(m.content)}</div>
     </div>`).join("") || `<div class="empty-state">No messages yet.</div>`;
 
+  const between = data.between || [agent1, agent2];
+  const displayA1 = between[0];
+  const displayA2 = between[1];
+
   $("#main").innerHTML = `
-    <a href="#/sessions" class="back-link">← Sessions</a>
+    <a href="#/conversations" class="back-link">← Conversations</a>
     <div class="page-header">
       <div>
-        <h2>${esc(data.topic || "(no topic)")}</h2>
-        <div class="subtitle">
-          <span class="mono-id">${esc(data.session_id)}</span> · ${statusBadge(data.status)}
-        </div>
+        <h2>${esc(displayA1)} ↔ ${esc(displayA2)}</h2>
+        <div class="subtitle">${data.message_count || 0} messages</div>
       </div>
       <div class="page-actions">
         <button class="ghost" onclick="route()">Refresh</button>
         <button class="ghost" id="download-md">Download .md</button>
         <button class="ghost" id="show-raw">Raw JSON</button>
-        <button class="danger" id="del-session">Delete</button>
+        <button class="danger" id="del-conv">Clear history</button>
       </div>
     </div>
     <div class="card">
       <div class="meta-grid">
-        <div class="kv"><span class="k">From</span><span class="v">${esc(data.from)}</span></div>
-        <div class="kv"><span class="k">To</span><span class="v">${esc(data.to)}</span></div>
-        <div class="kv"><span class="k">Turns</span><span class="v">${data.turn_count}</span></div>
-        <div class="kv"><span class="k">Created</span><span class="v">${fmtTime(data.created_at)}</span></div>
-        ${data.completed_at ? `<div class="kv"><span class="k">Completed</span><span class="v">${fmtTime(data.completed_at)}</span></div>` : ""}
-        ${data.description ? `<div class="kv" style="grid-column: 1 / -1"><span class="k">Description</span><span class="v">${esc(data.description)}</span></div>` : ""}
+        <div class="kv"><span class="k">Agent 1</span><span class="v"><a href="#/agents/${esc(displayA1)}">${esc(displayA1)}</a></span></div>
+        <div class="kv"><span class="k">Agent 2</span><span class="v"><a href="#/agents/${esc(displayA2)}">${esc(displayA2)}</a></span></div>
+        <div class="kv"><span class="k">Messages</span><span class="v">${data.message_count || 0}</span></div>
+        ${data.messages?.length ? `<div class="kv"><span class="k">First message</span><span class="v">${fmtTime(data.messages[0]?.timestamp)}</span></div>` : ""}
       </div>
     </div>
     <div class="card" style="margin-top: 12px">
@@ -474,14 +478,14 @@ async function renderSessionDetail(id) {
     card.style.display = card.style.display === "none" ? "block" : "none";
   });
 
-  $("#download-md").addEventListener("click", () => downloadTranscript(data));
+  $("#download-md").addEventListener("click", () => downloadTranscript(displayA1, displayA2, data));
 
-  $("#del-session").addEventListener("click", async () => {
-    if (!(await confirmAction(`Delete session '${data.session_id}' and its messages?`))) return;
+  $("#del-conv").addEventListener("click", async () => {
+    if (!(await confirmAction(`Clear all message history between ${displayA1} and ${displayA2}? This cannot be undone.`))) return;
     try {
-      await api(`/api/sessions/${encodeURIComponent(data.session_id)}`, { method: "DELETE" });
-      toast("Session deleted");
-      window.location.hash = "#/sessions";
+      const r = await api(convApiPath(displayA1, displayA2), { method: "DELETE" });
+      toast(`Cleared ${r.deleted || 0} messages`);
+      window.location.hash = "#/conversations";
     } catch (e) {
       toast(`Failed: ${e.message}`, "err");
     }
@@ -501,7 +505,7 @@ async function renderInvites() {
     <div class="list-item" style="cursor: default">
       <div class="row">
         <code class="mono">${esc(i.code)}</code>
-        ${i.used_by ? `<span class="badge completed">used</span>` : `<span class="badge active">unused</span>`}
+        ${i.used_by ? `<span class="badge used">used</span>` : `<span class="badge unused">unused</span>`}
       </div>
       <div class="meta">
         <span>created ${timeAgo(i.created_at)}</span>
@@ -543,7 +547,6 @@ async function renderInvites() {
     const count = parseInt($("#gen-count").value, 10) || 1;
     try {
       const r = await api("/api/invites", { method: "POST", body: { count } });
-      const codes = (r.codes || []).join(", ");
       toast(`Generated ${r.count || count} invite${r.count === 1 ? "" : "s"}`);
       renderInvites();
       if (r.codes && r.codes.length === 1) {
@@ -557,7 +560,7 @@ async function renderInvites() {
 
 // ─── kick off ─────────────────────────────────────────────
 
-window.route = route; // expose for inline handlers
+window.route = route;
 window.toast = toast;
 window.renderOverview = renderOverview;
 

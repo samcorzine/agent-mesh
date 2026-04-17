@@ -1,5 +1,5 @@
 /**
- * Agent Mesh — local admin dashboard.
+ * Agent Mesh — local admin dashboard (v4 DM mode).
  *
  * A tiny Express app intended to run on a trusted machine (LAN / VPN).
  * Holds the relay's admin key and proxies enriched views of the relay
@@ -50,6 +50,67 @@ async function relay(path, opts = {}) {
   return { status, body };
 }
 
+// ─── conversation discovery ──────────────────────────────────────────
+
+// Cache conversation pair data to avoid hammering the relay on every request.
+// With N agents we make N*(N-1)/2 requests to discover pairs.
+let conversationsCache = { data: null, expires: 0 };
+const CACHE_TTL = 8000; // 8 seconds
+
+async function fetchAgents() {
+  const r = await relay("/agents");
+  return r.body.agents || [];
+}
+
+async function fetchAllConversations() {
+  const now = Date.now();
+  if (conversationsCache.data && now < conversationsCache.expires) {
+    return conversationsCache.data;
+  }
+
+  const agents = await fetchAgents();
+  const names = agents.map(a => a.name);
+  const pairs = [];
+
+  // Build unique pairs
+  const pairKeys = [];
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      pairKeys.push([names[i], names[j]]);
+    }
+  }
+
+  // Fetch transcripts for all pairs in parallel
+  const results = await Promise.all(
+    pairKeys.map(async ([a1, a2]) => {
+      const r = await relay(`/transcript?with=${encodeURIComponent(a2)}&from=${encodeURIComponent(a1)}`);
+      return { a1, a2, data: r.body };
+    })
+  );
+
+  for (const { a1, a2, data } of results) {
+    const messages = data.messages || [];
+    if (messages.length === 0) continue;
+
+    const lastMsg = messages[messages.length - 1];
+    pairs.push({
+      agents: [a1, a2],
+      message_count: data.message_count || messages.length,
+      last_message: {
+        from: lastMsg.from,
+        content: lastMsg.content?.slice(0, 200) || "",
+        timestamp: lastMsg.timestamp,
+      },
+    });
+  }
+
+  // Sort by most recent activity
+  pairs.sort((a, b) => (b.last_message.timestamp || "").localeCompare(a.last_message.timestamp || ""));
+
+  conversationsCache = { data: pairs, expires: now + CACHE_TTL };
+  return pairs;
+}
+
 // ─── app setup ───────────────────────────────────────────────────────
 
 const app = express();
@@ -63,19 +124,6 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ─── helpers ─────────────────────────────────────────────────────────
-
-function sessionTime(s) {
-  // Best timestamp we have for sorting "most recent activity".
-  // The relay doesn't expose a `last_message_at`, so fall back to created_at.
-  return s.last_activity || s.created_at || "";
-}
-
-async function fetchAllSessions() {
-  const r = await relay("/sessions");
-  return r.body.sessions || [];
-}
-
 // ─── API routes ──────────────────────────────────────────────────────
 
 app.get("/api/status", async (_req, res) => {
@@ -84,47 +132,42 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/overview", async (_req, res) => {
-  const [agentsRes, sessions] = await Promise.all([
-    relay("/agents"),
-    fetchAllSessions(),
+  const [agents, conversations] = await Promise.all([
+    fetchAgents(),
+    fetchAllConversations(),
   ]);
-  const agents = agentsRes.body.agents || [];
 
-  const counts = { total: sessions.length, pending: 0, active: 0, completed: 0, rejected: 0 };
-  for (const s of sessions) {
-    if (counts[s.status] !== undefined) counts[s.status]++;
-  }
-
-  const recent = [...sessions]
-    .sort((a, b) => sessionTime(b).localeCompare(sessionTime(a)))
-    .slice(0, 10);
+  const totalMessages = conversations.reduce((sum, c) => sum + c.message_count, 0);
+  const recent = conversations.slice(0, 10);
 
   res.json({
     agent_count: agents.length,
-    session_counts: counts,
-    recent_sessions: recent,
+    conversation_count: conversations.length,
+    total_messages: totalMessages,
+    recent_conversations: recent,
   });
 });
 
 app.get("/api/agents", async (_req, res) => {
-  const [agentsRes, sessions] = await Promise.all([
-    relay("/agents"),
-    fetchAllSessions(),
+  const [agents, conversations] = await Promise.all([
+    fetchAgents(),
+    fetchAllConversations(),
   ]);
-  const agents = agentsRes.body.agents || [];
 
   const augmented = agents.map(a => {
-    const theirs = sessions.filter(s => s.from === a.name || s.to === a.name);
-    const last = theirs.reduce((acc, s) => {
-      const t = sessionTime(s);
+    const theirs = conversations.filter(c =>
+      c.agents[0] === a.name || c.agents[1] === a.name
+    );
+    const msgCount = theirs.reduce((sum, c) => sum + c.message_count, 0);
+    const lastTs = theirs.reduce((acc, c) => {
+      const t = c.last_message?.timestamp || "";
       return t > acc ? t : acc;
     }, "");
     return {
       ...a,
-      session_count: theirs.length,
-      active_count: theirs.filter(s => s.status === "active").length,
-      pending_count: theirs.filter(s => s.status === "pending").length,
-      last_activity: last,
+      conversation_count: theirs.length,
+      message_count: msgCount,
+      last_activity: lastTs,
     };
   });
 
@@ -133,52 +176,66 @@ app.get("/api/agents", async (_req, res) => {
 });
 
 app.get("/api/agents/:name", async (req, res) => {
-  const [agentsRes, sessions] = await Promise.all([
-    relay("/agents"),
-    fetchAllSessions(),
+  const [agents, conversations] = await Promise.all([
+    fetchAgents(),
+    fetchAllConversations(),
   ]);
-  const agent = (agentsRes.body.agents || []).find(a => a.name === req.params.name);
+  const agent = agents.find(a => a.name === req.params.name);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
 
-  const theirs = sessions
-    .filter(s => s.from === agent.name || s.to === agent.name)
-    .sort((a, b) => sessionTime(b).localeCompare(sessionTime(a)));
+  const theirs = conversations
+    .filter(c => c.agents[0] === agent.name || c.agents[1] === agent.name)
+    .map(c => ({
+      ...c,
+      peer: c.agents[0] === agent.name ? c.agents[1] : c.agents[0],
+    }));
 
-  res.json({ agent, sessions: theirs });
+  res.json({ agent, conversations: theirs });
 });
 
 app.delete("/api/agents/:name", async (req, res) => {
   const r = await relay(`/agents/${encodeURIComponent(req.params.name)}`, { method: "DELETE" });
+  // Invalidate cache after deletion
+  conversationsCache = { data: null, expires: 0 };
   res.status(r.status).json(r.body);
 });
 
-app.get("/api/sessions", async (req, res) => {
-  let sessions = await fetchAllSessions();
+app.get("/api/conversations", async (req, res) => {
+  let conversations = await fetchAllConversations();
 
-  const { status, agent, q } = req.query;
-  if (status) sessions = sessions.filter(s => s.status === status);
-  if (agent) sessions = sessions.filter(s => s.from === agent || s.to === agent);
+  const { agent, q } = req.query;
+  if (agent) {
+    conversations = conversations.filter(c =>
+      c.agents[0] === agent || c.agents[1] === agent
+    );
+  }
   if (q) {
     const lc = String(q).toLowerCase();
-    sessions = sessions.filter(s =>
-      (s.topic || "").toLowerCase().includes(lc) ||
-      (s.id || "").toLowerCase().includes(lc) ||
-      (s.from || "").toLowerCase().includes(lc) ||
-      (s.to || "").toLowerCase().includes(lc)
+    conversations = conversations.filter(c =>
+      c.agents[0].toLowerCase().includes(lc) ||
+      c.agents[1].toLowerCase().includes(lc)
     );
   }
 
-  sessions.sort((a, b) => sessionTime(b).localeCompare(sessionTime(a)));
-  res.json({ sessions });
+  res.json({ conversations });
 });
 
-app.get("/api/sessions/:id", async (req, res) => {
-  const r = await relay(`/sessions/${encodeURIComponent(req.params.id)}/transcript`);
+app.get("/api/conversations/:agent1/:agent2", async (req, res) => {
+  const { agent1, agent2 } = req.params;
+  const r = await relay(
+    `/transcript?with=${encodeURIComponent(agent2)}&from=${encodeURIComponent(agent1)}`
+  );
   res.status(r.status).json(r.body);
 });
 
-app.delete("/api/sessions/:id", async (req, res) => {
-  const r = await relay(`/sessions/${encodeURIComponent(req.params.id)}`, { method: "DELETE" });
+app.delete("/api/conversations/:agent1/:agent2", async (req, res) => {
+  const { agent1, agent2 } = req.params;
+  const r = await relay(
+    `/messages?agent1=${encodeURIComponent(agent1)}&agent2=${encodeURIComponent(agent2)}`,
+    { method: "DELETE" }
+  );
+  // Invalidate cache after deletion
+  conversationsCache = { data: null, expires: 0 };
   res.status(r.status).json(r.body);
 });
 
